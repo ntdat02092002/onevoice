@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "onevoice-realtime"
+version = "0.1.0"
+description = "Modular realtime ASR to machine-translation pipeline"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = {text = "MIT"}
+dependencies = [
+  "av>=12,<17",
+  "numpy>=1.26,<3",
+  "PyYAML>=6,<7",
+  "webrtcvad-wheels>=2.0.14,<3",
+]
+
+[project.optional-dependencies]
+moonshine = [
+  "moonshine-voice>=0.0.68,<1",
+]
+dolphin = [
+  "dataoceanai-dolphin>=20250716",
+]
+opus = [
+  "ctranslate2>=4.8,<5",
+  "sacremoses>=0.1,<1",
+  "sentencepiece>=0.2,<1",
+  "torch>=2.2,<3",
+  "transformers>=4.46,<5",
+]
+models = [
+  "faster-whisper>=1.1,<2",
+  "sentencepiece>=0.2,<1",
+  "torch>=2.2,<3",
+  "transformers>=4.46,<5",
+]
+app = [
+  "streamlit>=1.45,<2",
+  "streamlit-webrtc>=0.64,<1",
+]
+dev = [
+  "pytest>=8,<9",
+  "pytest-timeout>=2.3,<3",
+]
+all = [
+  "moonshine-voice>=0.0.68,<1",
+  "dataoceanai-dolphin>=20250716",
+  "ctranslate2>=4.8,<5",
+  "sacremoses>=0.1,<1",
+  "faster-whisper>=1.1,<2",
+  "sentencepiece>=0.2,<1",
+  "torch>=2.2,<3",
+  "transformers>=4.46,<5",
+  "streamlit>=1.45,<2",
+  "streamlit-webrtc>=0.64,<1",
+]
+
+[project.scripts]
+onevoice = "onevoice.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+markers = ["model: downloads and runs real model weights"]

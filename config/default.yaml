@@ -1,0 +1,42 @@
+audio:
+  sample_rate: 16000
+  frame_ms: 20
+  asr_chunk_ms: 500
+  queue_seconds: 20
+vad:
+  backend: webrtc
+  aggressiveness: 2
+  min_speech_ms: 250
+  end_silence_ms: 600
+  speech_padding_ms: 200
+  max_utterance_seconds: 15
+  semantic_endpoint_enabled: true
+  semantic_endpoint_sentences: 2
+asr:
+  backend: moonshine
+  model: auto
+  device: cpu
+  compute_type: int8
+  language: vi
+  beam_size: 1
+  model_dir: null
+  update_interval: 0.5
+  decoding_method: attention
+  offline: false
+commit:
+  backend: local_agreement
+  agreement_updates: 2
+  hold_tokens: 1
+translation:
+  backend: opus_ct2
+  model: opus-auto
+  device: cpu
+  compute_type: int8
+  model_dir: null
+  source_language: vi
+  target_language: en
+  wait_tokens: 3
+  update_tokens: 3
+  timeout_ms: 800
+  max_new_tokens: 256
+  offline: false
