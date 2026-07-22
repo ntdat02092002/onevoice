@@ -228,6 +228,25 @@ def test_stable_sentence_final_flushes_unpunctuated_tail() -> None:
     assert [request.text for request in requests] == ["unfinished final fragment"]
 
 
+def test_stable_sentence_does_not_repeat_acknowledged_prefix_on_final() -> None:
+    policy = PhraseTtsPolicy(
+        TtsConfig(
+            emission_mode="stable_sentence",
+            agreement_updates=2,
+            min_chunk_tokens=2,
+            max_chunk_tokens=24,
+        )
+    )
+    assert policy.requests_for(translation("Read this once.", 1)) == []
+    partial = policy.requests_for(translation("Read this once.", 2))
+    assert [request.text for request in partial] == ["Read this once."]
+    assert policy.mark_synthesized(partial[0].phrase_id)
+    assert policy.acknowledge(partial[0].phrase_id) is not None
+
+    assert policy.requests_for(translation("Read this once.", 3, final=True)) == []
+    assert policy.requests_for(translation("Read this once.", 3, final=True)) == []
+
+
 def test_fake_tts_contract_and_lifecycle() -> None:
     backend = FakeTtsBackend(TtsConfig(backend="fake"))
     backend.load()

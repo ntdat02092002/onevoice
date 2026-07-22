@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import io
+import wave
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic
 from typing import BinaryIO
@@ -9,6 +12,35 @@ import av
 import numpy as np
 
 from .models import AudioChunk
+
+
+@dataclass(slots=True)
+class RealtimePacer:
+    """Pace media against an absolute timeline without accumulating sleep drift."""
+
+    started_at: float = field(default_factory=monotonic)
+    media_elapsed: float = 0.0
+
+    def delay_after(self, duration_seconds: float, now: float | None = None) -> float:
+        self.media_elapsed += max(0.0, duration_seconds)
+        current = monotonic() if now is None else now
+        return max(0.0, self.started_at + self.media_elapsed - current)
+
+
+def encode_wav(samples: np.ndarray, sample_rate: int) -> bytes:
+    """Encode mono float32 samples as a downloadable 16-bit PCM WAV."""
+    if samples.ndim != 1:
+        raise ValueError("WAV samples must be mono")
+    if sample_rate <= 0:
+        raise ValueError("WAV sample_rate must be positive")
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2")
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm.tobytes())
+    return output.getvalue()
 
 
 def _frame_to_float32(frame: av.AudioFrame) -> np.ndarray:

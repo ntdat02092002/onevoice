@@ -113,6 +113,8 @@ class PhraseTtsPolicy:
         self.config = config
         self._states: dict[StreamId, _PhraseState] = {}
         self._phrase_streams: dict[int, StreamId] = {}
+        self._completed_streams: set[StreamId] = set()
+        self._completed_stream_order: deque[StreamId] = deque()
         self._next_phrase_id = 1
         self._lock = threading.RLock()
 
@@ -120,9 +122,16 @@ class PhraseTtsPolicy:
         with self._lock:
             self._states.clear()
             self._phrase_streams.clear()
+            self._completed_streams.clear()
+            self._completed_stream_order.clear()
 
     def reset_stream(self, stream_id: StreamId) -> None:
         with self._lock:
+            self._completed_streams.discard(stream_id)
+            try:
+                self._completed_stream_order.remove(stream_id)
+            except ValueError:
+                pass
             state = self._states.pop(stream_id, None)
             if state is not None:
                 for reservation in state.reservations:
@@ -132,6 +141,10 @@ class PhraseTtsPolicy:
         self, update: TranslationUpdate, stream_id: StreamId = (0, 0)
     ) -> list[TtsRequest]:
         with self._lock:
+            # Final delivery is idempotent. Queue retries or duplicate final MT
+            # results must not reopen a stream whose audio was already accepted.
+            if stream_id in self._completed_streams:
+                return []
             state = self._states.get(stream_id)
             if state is None:
                 state = _PhraseState(deque(maxlen=self.config.agreement_updates))
@@ -216,6 +229,7 @@ class PhraseTtsPolicy:
 
             if update.is_final and not state.reservations:
                 self._states.pop(stream_id, None)
+                self._mark_completed(stream_id)
             return requests
 
     def is_reserved(self, phrase_id: int) -> bool:
@@ -246,7 +260,18 @@ class PhraseTtsPolicy:
             final_complete = state.final_seen and not state.reservations
             if final_complete:
                 self._states.pop(stream_id, None)
+                self._mark_completed(stream_id)
             return stream_id, final_complete
+
+    def _mark_completed(self, stream_id: StreamId) -> None:
+        if stream_id in self._completed_streams:
+            return
+        # Only recent stream ids are needed to absorb queue/final retries.
+        # Bound the tombstones for long-running microphone sessions.
+        if len(self._completed_stream_order) >= 256:
+            self._completed_streams.discard(self._completed_stream_order.popleft())
+        self._completed_stream_order.append(stream_id)
+        self._completed_streams.add(stream_id)
 
     def cancel(self, phrase_id: int) -> StreamId | None:
         """Cancel a failed reservation and dependent unsynthesized suffixes."""
