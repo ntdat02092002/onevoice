@@ -4,8 +4,11 @@ import io
 import logging
 import threading
 import time
+from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import streamlit as st
 from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
@@ -14,6 +17,7 @@ from onevoice.backends.asr import asr_model_options, validate_asr_selection
 from onevoice.config import load_config
 from onevoice.models import EventType
 from onevoice.pipeline import RealtimePipeline
+from onevoice.text import ends_phrase
 
 
 st.set_page_config(page_title="OneVoice Realtime", page_icon="🎙️", layout="wide")
@@ -29,6 +33,9 @@ LANGUAGES = {
     "한국어": "ko",
 }
 
+REALTIME_PROFILE = Path(__file__).resolve().parents[1] / "config" / "realtime_conversation.yaml"
+PROFILE_DEFAULTS = load_config(REALTIME_PROFILE)
+
 
 def _empty_view() -> dict[str, Any]:
     return {
@@ -41,6 +48,21 @@ def _empty_view() -> dict[str, Any]:
         "language": "-",
         "asr_ms": 0.0,
         "mt_ms": 0.0,
+        "tts_ms": 0.0,
+        "tts_rtf": 0.0,
+        "tts_audio": None,
+        "tts_chunks": [],
+        "tts_chunk_texts": [],
+        "tts_session_chunks": [],
+        "tts_session_audio": None,
+        "tts_sample_rate": None,
+        "tts_text": "",
+        "tts_pending_audio": [],
+        "tts_playing": None,
+        "tts_playing_started_at": 0.0,
+        "file_session": False,
+        "file_complete": False,
+        "warnings": [],
         "errors": [],
     }
 
@@ -64,11 +86,14 @@ for key, value in _empty_view().items():
     runtime["view"].setdefault(key, value)
 
 st.title("🎙️ OneVoice Realtime Translation")
-st.caption("Offline ASR → Stable Prefix → Machine Translation")
+st.caption("Offline ASR → Stable Prefix → Machine Translation → Phrase TTS")
 
 with st.sidebar:
     st.header("Pipeline")
+    st.caption("Profile mặc định: realtime_conversation")
     controls_locked = runtime["pipeline"] is not None
+    if controls_locked:
+        st.caption(f"TTS emission: {runtime['pipeline'].config.tts.emission_mode}")
     source_label = st.selectbox("Ngôn ngữ nguồn", LANGUAGES, index=1, disabled=controls_locked)
     source = LANGUAGES[source_label]
     target_options = {name: code for name, code in LANGUAGES.items() if code != "auto" and code != source}
@@ -88,6 +113,13 @@ with st.sidebar:
         asr_capability_error = str(exc)
         st.error(asr_capability_error)
     mt_backend = st.selectbox("MT backend", ("opus_ct2", "m2m100", "fake"), disabled=controls_locked)
+    tts_enabled = st.checkbox("Bật phát giọng dịch (TTS)", value=False, disabled=controls_locked)
+    tts_backend = st.selectbox(
+        "TTS backend",
+        ("sherpa_onnx", "fake"),
+        disabled=controls_locked or not tts_enabled,
+        help="sherpa-onnx dùng model VITS/Piper offline; fake chỉ tạo tone để test pipeline.",
+    )
     device = st.selectbox("Device", ("cpu", "cuda"), disabled=controls_locked)
     compute_type = "int8" if device == "cpu" else "float16"
     offline = st.checkbox("Chỉ dùng model cache (offline)", value=False, disabled=controls_locked)
@@ -101,7 +133,7 @@ with st.sidebar:
         "Số câu trước khi tự chốt",
         min_value=1,
         max_value=10,
-        value=2,
+        value=PROFILE_DEFAULTS.vad.semantic_endpoint_sentences,
         step=1,
         disabled=controls_locked or not semantic_endpoint,
     )
@@ -113,7 +145,7 @@ with st.sidebar:
             use_container_width=True,
             disabled=asr_capability_error is not None,
         ):
-            config = load_config()
+            config = load_config(REALTIME_PROFILE)
             config.asr.backend = asr_backend
             config.asr.model = asr_model
             config.asr.device = device
@@ -131,6 +163,10 @@ with st.sidebar:
             config.translation.device = device
             config.translation.compute_type = compute_type
             config.translation.offline = offline
+            config.tts.enabled = tts_enabled
+            config.tts.backend = tts_backend
+            config.tts.device = device
+            config.tts.offline = offline
             with st.spinner("Đang nạp model. Lần đầu có thể cần tải model..."):
                 try:
                     pipeline = RealtimePipeline(config)
@@ -205,6 +241,11 @@ def feed_file(data: bytes, realtime: bool) -> None:
             if realtime:
                 time.sleep(chunk.duration_seconds)
         pipeline.finish()
+        if not pipeline.wait_until_idle(timeout=300):
+            runtime["view"]["warnings"].append(
+                "Pipeline chưa xử lý xong file sau 300 giây"
+            )
+        runtime["view"]["file_complete"] = True
     finally:
         runtime["mode"] = None
 
@@ -213,6 +254,7 @@ feeder = runtime.get("feeder")
 file_busy = feeder is not None and feeder.is_alive()
 if st.button("Chạy file", disabled=pipeline is None or uploaded is None or playing or file_busy):
     runtime["view"] = _empty_view()
+    runtime["view"]["file_session"] = True
     thread = threading.Thread(target=feed_file, args=(uploaded.getvalue(), realtime_file), daemon=True)
     runtime["feeder"] = thread
     thread.start()
@@ -262,7 +304,45 @@ def apply_events() -> None:
                 view["translation_current"] = event.payload.text
             view["mt_ms"] = event.payload.latency_ms
             view["status"] = "Hoàn tất" if event.payload.is_final else "Đang dịch"
-        elif event.type in (EventType.ERROR, EventType.OVERLOAD):
+        elif event.type in (EventType.TTS_PARTIAL, EventType.TTS_FINAL):
+            speech = event.payload
+            if view["tts_sample_rate"] not in (None, speech.sample_rate):
+                view["tts_chunks"] = []
+                view["tts_chunk_texts"] = []
+            view["tts_sample_rate"] = speech.sample_rate
+            view["tts_chunks"].append(speech.samples)
+            view["tts_chunk_texts"].append(speech.text)
+            view["tts_session_chunks"].append(speech.samples)
+            view["tts_session_audio"] = None
+            pipeline.acknowledge_tts(speech.phrase_id)
+            view["tts_text"] = event.payload.text
+            view["tts_ms"] = event.payload.latency_ms
+            view["tts_rtf"] = event.payload.real_time_factor
+            # Join only internal hard-limit chunks of one sentence. A completed
+            # sentence enters autoplay immediately; it no longer waits for the
+            # final event of the whole utterance.
+            if ends_phrase(speech.text, speech.language) or speech.is_final:
+                sentence_audio = np.concatenate(view["tts_chunks"]).astype(np.float32)
+                view["tts_audio"] = sentence_audio
+                view["tts_pending_audio"].append(
+                    replace(
+                        speech,
+                        samples=sentence_audio,
+                        text=" ".join(view["tts_chunk_texts"]),
+                    )
+                )
+                view["tts_chunks"] = []
+                view["tts_chunk_texts"] = []
+                view["status"] = "Hoàn tất"
+            else:
+                view["status"] = "Đang tổng hợp giọng dịch"
+        elif event.type == EventType.OVERLOAD:
+            view["warnings"].append(event.message)
+            view["warnings"] = view["warnings"][-5:]
+        elif event.type == EventType.ERROR:
+            if event.message.startswith(("Translation error:", "TTS error:")):
+                view["tts_chunks"] = []
+                view["tts_chunk_texts"] = []
             view["errors"].append(event.message)
             view["errors"] = view["errors"][-5:]
 
@@ -271,6 +351,18 @@ def apply_events() -> None:
 def realtime_results() -> None:
     apply_events()
     view = runtime["view"]
+
+    playing_speech = view["tts_playing"]
+    if playing_speech is not None:
+        elapsed = time.monotonic() - view["tts_playing_started_at"]
+        if elapsed >= playing_speech.duration_seconds + 0.15:
+            view["tts_playing"] = None
+            playing_speech = None
+    if playing_speech is None and view["tts_pending_audio"]:
+        playing_speech = view["tts_pending_audio"].pop(0)
+        view["tts_playing"] = playing_speech
+        view["tts_playing_started_at"] = time.monotonic()
+
     st.subheader("Kết quả realtime")
     st.write(f"Trạng thái: **{view['status']}** · Ngôn ngữ: **{view['language']}**")
     st.caption("Đang xử lý · utterance hiện tại")
@@ -296,9 +388,32 @@ def realtime_results() -> None:
             label_visibility="collapsed",
             disabled=True,
         )
-    metric_a, metric_b = st.columns(2)
+    metric_a, metric_b, metric_c, metric_d = st.columns(4)
     metric_a.metric("ASR latency", f"{view['asr_ms']:.0f} ms")
     metric_b.metric("MT latency", f"{view['mt_ms']:.0f} ms")
+    metric_c.metric("TTS latency", f"{view['tts_ms']:.0f} ms")
+    metric_d.metric("TTS RTF", f"{view['tts_rtf']:.2f}")
+
+    if playing_speech is not None:
+        st.caption(f"TTS đang phát · {playing_speech.text}")
+        st.audio(
+            playing_speech.samples,
+            sample_rate=playing_speech.sample_rate,
+            autoplay=True,
+        )
+        if view["tts_pending_audio"]:
+            st.caption(f"Còn {len(view['tts_pending_audio'])} phrase trong hàng đợi phát")
+    elif view["file_complete"] and view["tts_session_chunks"]:
+        if view["tts_session_audio"] is None:
+            view["tts_session_audio"] = np.concatenate(view["tts_session_chunks"]).astype(
+                np.float32
+            )
+        st.caption("TTS · toàn bộ file")
+        st.audio(
+            view["tts_session_audio"],
+            sample_rate=view["tts_sample_rate"],
+            autoplay=False,
+        )
 
     st.divider()
     st.subheader("Lịch sử hoàn tất")
@@ -321,6 +436,8 @@ def realtime_results() -> None:
             label_visibility="collapsed",
             disabled=True,
         )
+    for warning in view["warnings"]:
+        st.warning(warning)
     for error in view["errors"]:
         st.error(error)
 

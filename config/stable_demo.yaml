@@ -1,0 +1,15 @@
+vad:
+  semantic_endpoint_enabled: true
+  semantic_endpoint_sentences: 2
+commit:
+  agreement_updates: 3
+  hold_tokens: 1
+translation:
+  wait_tokens: 8
+  update_tokens: 6
+  timeout_ms: 1500
+  min_request_interval_ms: 700
+  sentence_boundary_only: false
+tts:
+  emission_mode: final_utterance
+  final_only: true

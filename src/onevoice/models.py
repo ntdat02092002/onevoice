@@ -20,6 +20,8 @@ class EventType(StrEnum):
     ASR_FINAL = "asr_final"
     TRANSLATION_PARTIAL = "translation_partial"
     TRANSLATION_FINAL = "translation_final"
+    TTS_PARTIAL = "tts_partial"
+    TTS_FINAL = "tts_final"
     OVERLOAD = "overload"
     ERROR = "error"
     METRIC = "metric"
@@ -106,6 +108,51 @@ class TranslationUpdate:
 
 
 @dataclass(frozen=True, slots=True)
+class TtsRequest:
+    text: str
+    language: str
+    source_revision: int
+    is_final: bool
+    phrase_id: int = 0
+    source_is_final: bool = False
+    requested_at: float = field(default_factory=monotonic)
+
+
+@dataclass(frozen=True, slots=True)
+class TtsUpdate:
+    samples: np.ndarray
+    sample_rate: int
+    text: str
+    language: str
+    source_revision: int
+    is_final: bool
+    phrase_id: int
+    started_at: float
+    source_is_final: bool = False
+    completed_at: float = field(default_factory=monotonic)
+
+    def __post_init__(self) -> None:
+        if self.samples.ndim != 1:
+            raise ValueError("TTS samples must be mono (one-dimensional)")
+        if self.sample_rate <= 0:
+            raise ValueError("TTS sample_rate must be positive")
+
+    @property
+    def latency_ms(self) -> float:
+        return max(0.0, (self.completed_at - self.started_at) * 1000)
+
+    @property
+    def duration_seconds(self) -> float:
+        return len(self.samples) / self.sample_rate
+
+    @property
+    def real_time_factor(self) -> float:
+        if self.duration_seconds == 0:
+            return 0.0
+        return (self.latency_ms / 1000) / self.duration_seconds
+
+
+@dataclass(frozen=True, slots=True)
 class PipelineEvent:
     type: EventType
     payload: Any = None
@@ -117,8 +164,13 @@ class PipelineEvent:
         payload = self.payload
         if hasattr(payload, "__dataclass_fields__"):
             payload = asdict(payload)
-        if isinstance(payload, np.ndarray):
-            payload = {"samples": len(payload)}
+        if isinstance(payload, dict):
+            payload = {
+                key: ({"sample_count": len(value)} if isinstance(value, np.ndarray) else value)
+                for key, value in payload.items()
+            }
+        elif isinstance(payload, np.ndarray):
+            payload = {"sample_count": len(payload)}
         return {
             "type": self.type.value,
             "message": self.message,

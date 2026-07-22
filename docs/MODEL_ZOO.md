@@ -93,6 +93,45 @@ License thay đổi theo pair/model card. Các pair Việt–Anh và phần lớ
 - Nặng và thường chậm hơn OPUS INT8 trên CPU, nhưng giữ context qua một model multilingual duy nhất.
 - Hỗ trợ CPU/CUDA qua PyTorch; license model: MIT.
 
+## Text-to-Speech
+
+| Backend | Model | Streaming trong OneVoice | Dependency |
+|---|---|---|---|
+| `sherpa_onnx` | Piper/VITS hoặc Supertonic 3 INT8 | Sentence-aware phrase 8–24 token, worker/queue riêng | `tts` |
+| `fake` | Tone kiểm thử | Giả lập | Không |
+
+`sherpa_onnx` là lựa chọn mặc định khi bật TTS vì phù hợp khuyến nghị offline/edge của report. Với `model: auto`, backend chọn voice theo ngôn ngữ đích, tải một lần từ release chính thức vào `.cache/onevoice/tts` và tái sử dụng cache. UI không yêu cầu đường dẫn model.
+
+| Target | Voice auto | Loại |
+|---|---|---|
+| `vi` | `vits-piper-vi_VN-25hours_single-low` | Piper/VITS 16 kHz |
+| `en` | `vits-piper-en_US-amy-low` | Piper/VITS 16 kHz |
+| `zh` | `vits-piper-zh_CN-chaowen-medium` | Piper/VITS 22.05 kHz |
+| `ko` | `sherpa-onnx-supertonic-3-tts-int8-2026-05-11` | Supertonic 3 INT8 24 kHz |
+
+```yaml
+tts:
+  enabled: true
+  backend: sherpa_onnx
+  model: auto
+  language: auto
+  cache_dir: .cache/onevoice/tts
+  offline: false
+  device: cpu
+  num_threads: 2
+  speaker_id: 0
+  speed: 0.9
+  min_chunk_tokens: 8
+  max_chunk_tokens: 24
+  agreement_updates: 2
+  sentence_boundary_only: true
+  final_only: true
+  emission_mode: final_utterance
+  timeout_ms: 700
+```
+
+`language: auto` được pipeline resolve thành target language. Bật `offline: true` chỉ sau khi voice đã có trong cache. `model_dir` và các tên asset vẫn được backend hỗ trợ cho custom voice nhưng là advanced YAML override, không xuất hiện trên UI.
+
 ## VAD và endpoint
 
 | Backend | Option | Mục đích |
@@ -114,7 +153,7 @@ vad:
   semantic_endpoint_sentences: 2
 ```
 
-Semantic endpoint đóng utterance khi stable/committed có đủ số câu hoàn chỉnh. Đặt `semantic_endpoint_enabled: false` để chỉ dùng silence/max-duration endpoint.
+Semantic endpoint đóng utterance khi stable/committed có đủ số câu hoàn chỉnh và không còn fragment câu tiếp theo. Đặt `semantic_endpoint_enabled: false` để chỉ dùng silence/max-duration endpoint.
 
 ## Audio preprocessing, commit và translation policy
 
@@ -152,6 +191,9 @@ translation:
   backend: opus_ct2
   model: opus-auto
   target_language: vi
+tts:
+  enabled: true
+  backend: fake
   device: cpu
   compute_type: int8
 ```
@@ -204,6 +246,9 @@ python -m pip install -e ".[dolphin,app]"
 
 # Faster-Whisper hoặc M2M100
 python -m pip install -e ".[models,app]"
+
+# TTS VITS/Piper qua sherpa-onnx
+python -m pip install -e ".[tts,app]"
 
 # Tất cả backend
 python -m pip install -e ".[all,app]"

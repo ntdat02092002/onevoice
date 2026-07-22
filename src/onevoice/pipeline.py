@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import queue
 import threading
+from collections import Counter
 from dataclasses import dataclass
+from enum import StrEnum
 from time import monotonic
 from typing import Any
 
@@ -18,11 +20,19 @@ from .models import (
     PipelineEvent,
     SpeechSegment,
     TranslationRequest,
+    TtsRequest,
 )
-from .policy import WaitKTranslationPolicy
-from .protocols import AudioPreprocessor, CommitPolicy, StreamingAsrBackend, TranslationBackend, VadBackend
+from .policy import PhraseTtsPolicy, WaitKTranslationPolicy
+from .protocols import (
+    AudioPreprocessor,
+    CommitPolicy,
+    StreamingAsrBackend,
+    TranslationBackend,
+    TtsBackend,
+    VadBackend,
+)
 from .registry import registry
-from .text import count_complete_sentences
+from .text import count_complete_sentences, ends_phrase, tokenize_text
 
 
 _STOP = object()
@@ -42,8 +52,21 @@ class _TranslationJob:
     request: TranslationRequest
 
 
+@dataclass(slots=True)
+class _TtsJob:
+    generation: int
+    utterance_id: int
+    request: TtsRequest
+
+
+class EnqueueResult(StrEnum):
+    ENQUEUED = "enqueued"
+    REPLACED_PARTIAL = "replaced_partial"
+    DROPPED_PARTIAL = "dropped_partial"
+
+
 class RealtimePipeline:
-    """Threaded, bounded-queue ASR -> stable-prefix -> MT pipeline."""
+    """Threaded, bounded-queue ASR -> stable-prefix -> MT -> TTS pipeline."""
 
     def __init__(
         self,
@@ -54,22 +77,32 @@ class RealtimePipeline:
         asr: StreamingAsrBackend | None = None,
         committer: CommitPolicy | None = None,
         translator: TranslationBackend | None = None,
+        tts: TtsBackend | None = None,
     ) -> None:
         self.config = config
         config.validate()
+        if config.tts.language == "auto":
+            config.tts.language = config.translation.target_language
         self.preprocessor = preprocessor or registry.create("preprocessor", "passthrough")
         self.vad = vad or registry.create(
             "vad", config.vad.backend, config=config.vad, audio_config=config.audio
         )
         self.asr = asr or registry.create("asr", config.asr.backend, config=config.asr)
-        self.committer = committer or registry.create("commit", config.commit.backend, config=config.commit)
+        self.committer = committer or registry.create(
+            "commit", config.commit.backend, config=config.commit
+        )
         self.translator = translator or registry.create(
             "translation", config.translation.backend, config=config.translation
         )
+        self.tts = tts or registry.create("tts", config.tts.backend, config=config.tts)
         audio_capacity = max(8, config.audio.queue_seconds * 1000 // config.audio.frame_ms)
         self._audio_queue: queue.Queue[Any] = queue.Queue(maxsize=audio_capacity)
         self._asr_queue: queue.Queue[Any] = queue.Queue(maxsize=4)
         self._translation_queue: queue.Queue[Any] = queue.Queue(maxsize=2)
+        # A final translation can split into several sentence-aware phrases at
+        # once. Keep enough room for the whole utterance so UI playback does
+        # not lose an early phrase while synthesis catches up.
+        self._tts_queue: queue.Queue[Any] = queue.Queue(maxsize=32)
         self._events: queue.Queue[PipelineEvent] = queue.Queue(maxsize=512)
         self._stop_event = threading.Event()
         self._reset_audio = threading.Event()
@@ -78,37 +111,100 @@ class RealtimePipeline:
         self._generation = 0
         self._latest_translation_revisions: dict[tuple[int, int], int] = {}
         self._latest_lock = threading.Lock()
+        self._metrics: Counter[str] = Counter()
+        self._metrics_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
         self._started = False
         self._speech_active = False
         self._utterance_sequence = 0
         self._active_utterance_id = 0
         self._translation_policy = WaitKTranslationPolicy(config.translation)
+        self._tts_policy = PhraseTtsPolicy(config.tts)
 
     @property
     def is_running(self) -> bool:
         return self._started and not self._stop_event.is_set()
+
+    def metrics_snapshot(self) -> dict[str, int]:
+        with self._metrics_lock:
+            return dict(self._metrics)
+
+    def _count_metric(self, name: str, amount: int = 1) -> None:
+        with self._metrics_lock:
+            self._metrics[name] += amount
 
     def start(self, *, load_models: bool = True) -> None:
         if self._started:
             return
         self._stop_event.clear()
         self._emit(EventType.STATUS, message="loading")
-        self.preprocessor.load()
-        self.vad.load()
-        self.committer.load()
-        if load_models:
-            self.asr.load()
-            self.translator.load()
-        self._threads = [
-            threading.Thread(target=self._audio_worker, name="onevoice-audio", daemon=True),
-            threading.Thread(target=self._asr_worker, name="onevoice-asr", daemon=True),
-            threading.Thread(target=self._translation_worker, name="onevoice-mt", daemon=True),
-        ]
-        for thread in self._threads:
-            thread.start()
+        loaded: list[Any] = []
+        started_threads: list[threading.Thread] = []
+        try:
+            for backend in (self.preprocessor, self.vad, self.committer):
+                loaded.append(backend)
+                backend.load()
+            if load_models:
+                # sherpa-onnx and Moonshine both bundle ONNX Runtime on Windows.
+                # Load sherpa's newer ORT first so Moonshine can use its
+                # backwards-compatible API in the same process.
+                model_backends = (
+                    [self.tts] if self.config.tts.enabled else []
+                ) + [self.asr, self.translator]
+                for backend in model_backends:
+                    loaded.append(backend)
+                    backend.load()
+            self._threads = [
+                threading.Thread(target=self._audio_worker, name="onevoice-audio", daemon=True),
+                threading.Thread(target=self._asr_worker, name="onevoice-asr", daemon=True),
+                threading.Thread(target=self._translation_worker, name="onevoice-mt", daemon=True),
+            ]
+            if self.config.tts.enabled:
+                self._threads.append(
+                    threading.Thread(target=self._tts_worker, name="onevoice-tts", daemon=True)
+                )
+            for thread in self._threads:
+                thread.start()
+                started_threads.append(thread)
+        except Exception:
+            self._rollback_start(loaded, started_threads)
+            raise
         self._started = True
         self._emit(EventType.STATUS, message="listening")
+
+    def _rollback_start(
+        self, loaded: list[Any], started_threads: list[threading.Thread]
+    ) -> None:
+        self._stop_event.set()
+        for work_queue in (
+            self._audio_queue,
+            self._asr_queue,
+            self._translation_queue,
+            self._tts_queue,
+        ):
+            try:
+                work_queue.put_nowait(_STOP)
+            except queue.Full:
+                pass
+        for thread in started_threads:
+            thread.join(timeout=1)
+        for backend in reversed(loaded):
+            try:
+                backend.close()
+            except Exception:
+                pass
+        for work_queue in (
+            self._audio_queue,
+            self._asr_queue,
+            self._translation_queue,
+            self._tts_queue,
+        ):
+            self._drain_queue(work_queue)
+        self._threads = []
+        self._tts_policy.reset()
+        self._translation_policy.reset()
+        self._stop_event.clear()
+        self._started = False
 
     def push_audio(self, chunk: AudioChunk) -> bool:
         if not self.is_running:
@@ -124,7 +220,12 @@ class RealtimePipeline:
         if not self.is_running:
             return
         sequence = int(monotonic() * 1000)
-        eos = AudioChunk(np.empty(0, dtype=np.float32), self.config.audio.sample_rate, sequence, end_of_stream=True)
+        eos = AudioChunk(
+            np.empty(0, dtype=np.float32),
+            self.config.audio.sample_rate,
+            sequence,
+            end_of_stream=True,
+        )
         try:
             self._audio_queue.put(eos, timeout=1)
         except queue.Full:
@@ -138,6 +239,7 @@ class RealtimePipeline:
             self._audio_queue.join()
             self._asr_queue.join()
             self._translation_queue.join()
+            self._tts_queue.join()
             done.set()
 
         waiter = threading.Thread(target=wait_queues, daemon=True)
@@ -150,15 +252,29 @@ class RealtimePipeline:
         self.finish()
         self.wait_until_idle(timeout)
         self._stop_event.set()
-        for work_queue in (self._audio_queue, self._asr_queue, self._translation_queue):
+        work_queues = [self._audio_queue, self._asr_queue, self._translation_queue]
+        if self.config.tts.enabled:
+            work_queues.append(self._tts_queue)
+        for work_queue in work_queues:
             try:
                 work_queue.put_nowait(_STOP)
             except queue.Full:
                 pass
         for thread in self._threads:
             thread.join(timeout=timeout / max(1, len(self._threads)))
-        for backend in (self.preprocessor, self.vad, self.asr, self.committer, self.translator):
+        for backend in (
+            self.preprocessor,
+            self.vad,
+            self.asr,
+            self.committer,
+            self.translator,
+            self.tts,
+        ):
             backend.close()
+        self._translation_policy.reset()
+        self._tts_policy.reset()
+        with self._latest_lock:
+            self._latest_translation_revisions.clear()
         self._started = False
         self._emit(EventType.STATUS, message="stopped")
 
@@ -167,6 +283,7 @@ class RealtimePipeline:
         for _ in range(limit):
             try:
                 output.append(self._events.get_nowait())
+                self._events.task_done()
             except queue.Empty:
                 break
         return output
@@ -185,6 +302,8 @@ class RealtimePipeline:
         self._drain_queue(self._audio_queue)
         self._drain_queue(self._asr_queue)
         self._drain_queue(self._translation_queue)
+        self._drain_queue(self._tts_queue)
+        self._tts_policy.reset()
         self._emit(EventType.OVERLOAD, message="Audio queue full; current utterance was reset")
 
     @staticmethod
@@ -222,6 +341,7 @@ class RealtimePipeline:
                             segment,
                         ),
                         segment.is_final,
+                        stage="ASR",
                     )
                     if segment.is_final:
                         self._speech_active = False
@@ -253,26 +373,49 @@ class RealtimePipeline:
                 if item.generation != self._current_generation():
                     continue
                 event_type = EventType.ASR_FINAL if update.is_final else EventType.ASR_PARTIAL
-                self._emit(event_type, payload=update, metrics={"asr_latency_ms": update.latency_ms})
+                self._emit(
+                    event_type,
+                    payload=update,
+                    metrics={"asr_latency_ms": update.latency_ms},
+                )
                 committed = self.committer.update(update)
                 if update.is_final:
                     self._semantic_endpoint_pending.clear()
                 if committed is None:
                     continue
-                self._emit(EventType.ASR_COMMITTED, payload=committed)
-                self._maybe_request_semantic_endpoint(committed)
+                self._emit(
+                    EventType.ASR_COMMITTED,
+                    payload=committed,
+                    metrics={
+                        "asr_commit_latency_ms": max(
+                            0.0,
+                            (committed.committed_at - item.segment.started_at) * 1000,
+                        )
+                    },
+                )
+                self._maybe_request_semantic_endpoint(committed, update.text)
                 request = self._translation_policy.request_for(
                     committed, self.config.translation.target_language
                 )
                 if request is not None:
                     revision_key = (item.generation, item.utterance_id)
-                    with self._latest_lock:
-                        self._latest_translation_revisions[revision_key] = request.source_revision
-                    self._put_latest(
-                        self._translation_queue,
-                        _TranslationJob(item.generation, item.utterance_id, request),
-                        request.is_final,
+                    enqueue_started = monotonic()
+                    enqueue_result = self._enqueue_translation(
+                        _TranslationJob(item.generation, item.utterance_id, request)
                     )
+                    if enqueue_result in (
+                        EnqueueResult.ENQUEUED,
+                        EnqueueResult.REPLACED_PARTIAL,
+                    ):
+                        self._translation_policy.mark_enqueued(request)
+                        self._count_metric("mt_requests_enqueued")
+                        if enqueue_result == EnqueueResult.REPLACED_PARTIAL:
+                            self._count_metric("mt_partials_coalesced")
+                        if request.is_final:
+                            wait_ms = int((monotonic() - enqueue_started) * 1000)
+                            self._count_metric("mt_final_queue_wait_ms", wait_ms)
+                    else:
+                        self._count_metric("mt_partials_dropped")
                 if committed.is_final:
                     self._translation_policy.reset()
                     self.asr.reset()
@@ -281,13 +424,19 @@ class RealtimePipeline:
             finally:
                 self._asr_queue.task_done()
 
-    def _maybe_request_semantic_endpoint(self, committed: CommittedTranscript) -> None:
+    def _maybe_request_semantic_endpoint(
+        self, committed: CommittedTranscript, active_hypothesis: str | None = None
+    ) -> None:
         config = self.config.vad
+        active_text = active_hypothesis or committed.text
         if (
             committed.is_final
             or not config.semantic_endpoint_enabled
             or self._semantic_endpoint_pending.is_set()
-            or count_complete_sentences(committed.tokens) < config.semantic_endpoint_sentences
+            or count_complete_sentences(committed.text, committed.language)
+            < config.semantic_endpoint_sentences
+            or not ends_phrase(committed.text, committed.language)
+            or not ends_phrase(active_text, committed.language)
         ):
             return
         request_endpoint = getattr(self.vad, "request_endpoint", None)
@@ -313,41 +462,227 @@ class RealtimePipeline:
                 assert isinstance(item, _TranslationJob)
                 if item.generation != self._current_generation():
                     continue
+                queue_delay_ms = max(
+                    0.0, (monotonic() - item.request.requested_at) * 1000
+                )
+                self._count_metric("mt_inference_count")
                 result = self.translator.translate(item.request)
                 revision_key = (item.generation, item.utterance_id)
                 with self._latest_lock:
                     latest = self._latest_translation_revisions.get(revision_key, -1)
                 if item.generation != self._current_generation() or result.source_revision < latest:
+                    self._count_metric("mt_stale_results")
                     continue
                 event_type = (
                     EventType.TRANSLATION_FINAL if result.is_final else EventType.TRANSLATION_PARTIAL
                 )
-                self._emit(event_type, payload=result, metrics={"mt_latency_ms": result.latency_ms})
+                self._emit(
+                    event_type,
+                    payload=result,
+                    metrics={
+                        "mt_latency_ms": result.latency_ms,
+                        "mt_queue_delay_ms": queue_delay_ms,
+                        "mt_request_tokens": float(
+                            len(
+                                tokenize_text(
+                                    item.request.text,
+                                    item.request.source_language,
+                                )
+                            )
+                        ),
+                    },
+                )
+                if self.config.tts.enabled:
+                    stream_id = (item.generation, item.utterance_id)
+                    for request in self._tts_policy.requests_for(result, stream_id):
+                        accepted, evicted = self._put_latest(
+                            self._tts_queue,
+                            _TtsJob(item.generation, item.utterance_id, request),
+                            request.source_is_final,
+                            stage="TTS",
+                        )
+                        if isinstance(evicted, _TtsJob):
+                            self._tts_policy.cancel(evicted.request.phrase_id)
+                        if not accepted:
+                            self._tts_policy.cancel(request.phrase_id)
+                        else:
+                            self._count_metric("tts_requests_enqueued")
                 if result.is_final:
                     with self._latest_lock:
                         self._latest_translation_revisions.pop(revision_key, None)
             except Exception as exc:
+                if isinstance(item, _TranslationJob) and item.request.is_final:
+                    stream_id = (item.generation, item.utterance_id)
+                    self._tts_policy.reset_stream(stream_id)
                 self._emit(EventType.ERROR, message=f"Translation error: {exc}")
             finally:
                 self._translation_queue.task_done()
 
-    def _put_latest(self, work_queue: queue.Queue[Any], item: Any, must_keep: bool) -> None:
+    def _tts_worker(self) -> None:
+        seen_generation = -1
+        while not self._stop_event.is_set():
+            item = self._tts_queue.get()
+            try:
+                if item is _STOP:
+                    return
+                assert isinstance(item, _TtsJob)
+                if item.generation != self._current_generation():
+                    self._tts_policy.cancel(item.request.phrase_id)
+                    continue
+                if not self._tts_policy.is_reserved(item.request.phrase_id):
+                    continue
+                if item.generation != seen_generation:
+                    self.tts.reset()
+                    seen_generation = item.generation
+                self._count_metric("tts_inference_count")
+                result = self.tts.synthesize(item.request)
+                if item.generation != self._current_generation():
+                    self._tts_policy.cancel(item.request.phrase_id)
+                    continue
+                # Phrase validity is content-based inside PhraseTtsPolicy. A
+                # newer utterance revision does not invalidate audio whose
+                # exact stable prefix/sentence is still reserved.
+                if not self._tts_policy.mark_synthesized(item.request.phrase_id):
+                    continue
+                event_type = EventType.TTS_FINAL if result.is_final else EventType.TTS_PARTIAL
+                delivered = self._emit(
+                    event_type,
+                    payload=result,
+                    metrics={
+                        "tts_latency_ms": result.latency_ms,
+                        "tts_rtf": result.real_time_factor,
+                        "tts_queue_delay_ms": max(
+                            0.0,
+                            (result.started_at - item.request.requested_at) * 1000,
+                        ),
+                        "tts_audio_duration_ms": result.duration_seconds * 1000,
+                    },
+                )
+                if not delivered:
+                    self._tts_policy.cancel(item.request.phrase_id)
+            except Exception as exc:
+                if isinstance(item, _TtsJob):
+                    stream_id = (item.generation, item.utterance_id)
+                    self._tts_policy.reset_stream(stream_id)
+                    try:
+                        self.tts.reset()
+                    except Exception:
+                        pass
+                self._emit(EventType.ERROR, message=f"TTS error: {exc}")
+            finally:
+                self._tts_queue.task_done()
+
+    def _enqueue_translation(self, item: _TranslationJob) -> EnqueueResult:
+        """Coalesce pending partials per stream while keeping every final lossless."""
+        stream_id = (item.generation, item.utterance_id)
+        coalesced = False
+        result = EnqueueResult.ENQUEUED
+        # Lock order is latest -> queue everywhere that touches both. Final jobs
+        # use an unbounded logical lane, so this transaction never waits while
+        # holding either lock. The worker cannot observe a job before its
+        # accepted revision is published.
+        with self._latest_lock, self._translation_queue.mutex:
+            for index, queued in enumerate(self._translation_queue.queue):
+                if (
+                    isinstance(queued, _TranslationJob)
+                    and not queued.request.is_final
+                    and (queued.generation, queued.utterance_id) == stream_id
+                ):
+                    if item.request.is_final:
+                        del self._translation_queue.queue[index]
+                        self._translation_queue.unfinished_tasks -= 1
+                        coalesced = True
+                    else:
+                        self._translation_queue.queue[index] = item
+                        result = EnqueueResult.REPLACED_PARTIAL
+                    break
+
+            if result != EnqueueResult.REPLACED_PARTIAL:
+                if not item.request.is_final and (
+                    self._translation_queue._qsize() >= self._translation_queue.maxsize
+                ):
+                    result = EnqueueResult.DROPPED_PARTIAL
+                else:
+                    # Final insertion may exceed Queue.maxsize. This is the
+                    # dedicated lossless final lane; only partials are bounded.
+                    self._translation_queue._put(item)
+                    self._translation_queue.unfinished_tasks += 1
+
+            if result in (EnqueueResult.ENQUEUED, EnqueueResult.REPLACED_PARTIAL):
+                self._latest_translation_revisions[stream_id] = item.request.source_revision
+                self._translation_queue.not_empty.notify()
+
+        if result == EnqueueResult.DROPPED_PARTIAL:
+            self._emit(
+                EventType.OVERLOAD,
+                message="MT queue is lagging; partial update coalesced/dropped",
+            )
+            return result
+        if coalesced:
+            self._count_metric("mt_partials_coalesced")
+        return result
+
+    def _put_latest(
+        self,
+        work_queue: queue.Queue[Any],
+        item: Any,
+        must_keep: bool,
+        *,
+        stage: str,
+    ) -> tuple[bool, Any | None]:
         try:
             work_queue.put_nowait(item)
+            return True, None
         except queue.Full:
             # Never let a newer partial snapshot evict an already queued final.
             if not must_keep:
-                self._emit(EventType.OVERLOAD, message="Inference queue is lagging; partial update skipped")
-                return
-            try:
-                work_queue.get_nowait()
-                work_queue.task_done()
-            except queue.Empty:
-                pass
-            try:
-                work_queue.put(item, timeout=1)
-            except queue.Full:
-                self._emit(EventType.OVERLOAD, message="Inference queue is lagging")
+                self._emit(
+                    EventType.OVERLOAD,
+                    message=f"{stage} queue is lagging; partial update skipped, final is preserved",
+                )
+                return False, None
+            # A final is lossless pipeline state: dropping an older final here
+            # removes a complete utterance from both transcript and translation
+            # history. Reclaim a queued partial if possible; if the queue only
+            # contains finals, apply backpressure until the consumer advances.
+            evicted = self._evict_oldest_partial(work_queue)
+            while not self._stop_event.is_set():
+                try:
+                    work_queue.put(item, timeout=0.1)
+                    return True, evicted
+                except queue.Full:
+                    continue
+            return False, evicted
+
+    @staticmethod
+    def _evict_oldest_partial(work_queue: queue.Queue[Any]) -> Any | None:
+        """Remove one non-final job without disturbing queued final jobs."""
+        with work_queue.mutex:
+            for index, queued in enumerate(work_queue.queue):
+                if queued is _STOP or RealtimePipeline._is_final_job(queued):
+                    continue
+                del work_queue.queue[index]
+                work_queue.unfinished_tasks -= 1
+                if work_queue.unfinished_tasks == 0:
+                    work_queue.all_tasks_done.notify_all()
+                work_queue.not_full.notify()
+                return queued
+        return None
+
+    @staticmethod
+    def _is_final_job(item: Any) -> bool:
+        if isinstance(item, _AsrJob):
+            return item.segment.is_final
+        if isinstance(item, (_TranslationJob, _TtsJob)):
+            return item.request.is_final or bool(
+                getattr(item.request, "source_is_final", False)
+            )
+        # Unknown queue items are treated as non-droppable.
+        return True
+
+    def acknowledge_tts(self, phrase_id: int) -> bool:
+        """Acknowledge that a synthesized phrase entered the playback queue."""
+        return self._tts_policy.acknowledge(phrase_id) is not None
 
     def _emit(
         self,
@@ -356,13 +691,60 @@ class RealtimePipeline:
         payload: Any = None,
         message: str = "",
         metrics: dict[str, float] | None = None,
-    ) -> None:
+    ) -> bool:
         event = PipelineEvent(event_type, payload, message, metrics=metrics or {})
         try:
             self._events.put_nowait(event)
+            return True
         except queue.Full:
-            try:
-                self._events.get_nowait()
-                self._events.put_nowait(event)
-            except queue.Empty:
-                pass
+            # UI history is built from terminal events. A burst of partials
+            # must never evict an already completed utterance.
+            if not self._is_lossless_event(event):
+                return False
+            discarded = self._evict_oldest_partial_event()
+            if discarded is not None:
+                self._cancel_discarded_tts_event(discarded)
+            while not self._stop_event.is_set():
+                try:
+                    self._events.put(event, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+    @staticmethod
+    def _is_lossless_event(event: PipelineEvent) -> bool:
+        if event.type in (
+            EventType.ERROR,
+            EventType.OVERLOAD,
+            EventType.ASR_FINAL,
+            EventType.TRANSLATION_FINAL,
+        ):
+            return True
+        if event.type == EventType.ASR_COMMITTED:
+            return bool(event.payload and event.payload.is_final)
+        if event.type == EventType.TTS_FINAL:
+            return True
+        if event.type == EventType.TTS_PARTIAL and bool(
+            getattr(event.payload, "source_is_final", False)
+        ):
+            return True
+        return False
+
+    def _evict_oldest_partial_event(self) -> PipelineEvent | None:
+        with self._events.mutex:
+            for index, queued in enumerate(self._events.queue):
+                if self._is_lossless_event(queued):
+                    continue
+                del self._events.queue[index]
+                self._events.unfinished_tasks -= 1
+                if self._events.unfinished_tasks == 0:
+                    self._events.all_tasks_done.notify_all()
+                self._events.not_full.notify()
+                return queued
+        return None
+
+    def _cancel_discarded_tts_event(self, event: PipelineEvent) -> None:
+        if event.type not in (EventType.TTS_PARTIAL, EventType.TTS_FINAL):
+            return
+        self._tts_policy.cancel(event.payload.phrase_id)

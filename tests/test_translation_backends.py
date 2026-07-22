@@ -94,6 +94,38 @@ def test_opus_uses_language_prefix_and_greedy_decode() -> None:
     assert translator.kwargs["max_decoding_length"] == 64
 
 
+def test_opus_translates_final_sentence_by_sentence_and_restores_punctuation() -> None:
+    backend = OpusMtCTranslate2Backend(TranslationConfig())
+    calls: list[str] = []
+    backend._ensure_route = lambda source, target: ((source, target),)
+
+    def translate_once(text: str, pair: tuple[str, str]) -> str:
+        calls.append(text)
+        return {"First sentence.": "Câu đầu", "Second sentence?": "Câu sau"}[text]
+
+    backend._translate_once = translate_once
+    result = backend.translate(
+        TranslationRequest("First sentence. Second sentence?", "en", "vi", 3, True)
+    )
+
+    assert calls == ["First sentence.", "Second sentence?"]
+    assert result.text == "Câu đầu. Câu sau?"
+
+
+def test_opus_translates_partial_prefix_once_without_sentence_loop() -> None:
+    backend = OpusMtCTranslate2Backend(TranslationConfig())
+    calls: list[str] = []
+    backend._ensure_route = lambda source, target: ((source, target),)
+    backend._translate_once = lambda text, pair: calls.append(text) or "partial result"
+
+    result = backend.translate(
+        TranslationRequest("Sentence one. Sentence two. active", "en", "vi", 2, False)
+    )
+
+    assert calls == ["Sentence one. Sentence two. active"]
+    assert result.text == "partial result"
+
+
 def test_translation_capabilities_fail_before_model_loading() -> None:
     with pytest.raises(ValueError, match="source and target must differ"):
         OpusMtCTranslate2Backend(

@@ -8,7 +8,7 @@ from onevoice.registry import registry
 def test_model_zoo_covers_registered_backends_and_model_routes() -> None:
     text = Path("docs/MODEL_ZOO.md").read_text(encoding="utf-8")
 
-    for kind in ("asr", "translation", "vad", "preprocessor", "commit"):
+    for kind in ("asr", "translation", "tts", "vad", "preprocessor", "commit"):
         for backend in registry.names(kind):
             assert f"`{backend}`" in text
     for language, models in MOONSHINE_MODELS_BY_LANGUAGE.items():

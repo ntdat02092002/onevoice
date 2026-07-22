@@ -10,7 +10,9 @@ WebRTC microphone / audio file
   -> Local Agreement stable prefix
   -> Wait-k policy
   -> OPUS-MT + CTranslate2 INT8 translation (M2M100 optional)
-  -> CLI / Streamlit events
+  -> Sentence-aware Local Agreement phrase chunker (8–24 token)
+  -> sherpa-onnx VITS/Piper TTS (optional)
+  -> CLI / Streamlit audio events
 ```
 
 ## Cài đặt
@@ -22,6 +24,9 @@ python -m venv venv
 .\venv\Scripts\Activate.ps1
 python -m pip install -U pip
 python -m pip install -e ".[moonshine,opus,app,dev]"
+
+# Thêm TTS offline
+python -m pip install -e ".[moonshine,opus,tts,app,dev]"
 ```
 
 Project khóa `transformers>=4.46,<5`. Nhánh Transformers 5.x có thể lazy-import các image processor như ZoeDepth và đòi `torchvision` dù pipeline chỉ xử lý text; không cài `torchvision` để chữa lỗi này.
@@ -64,6 +69,9 @@ Chạy toàn pipeline bằng fake model, không tải weights:
 
 ```powershell
 onevoice sample.wav --source en --target vi --asr-backend fake --mt-backend fake
+
+# Smoke test cả TTS queue không tải model (phát tone fake)
+onevoice sample.wav --source en --target vi --asr-backend fake --mt-backend fake --tts --tts-backend fake
 ```
 
 CLI xuất JSON Lines cho ASR partial/final, stable transcript, translation và latency.
@@ -89,12 +97,15 @@ Các contract chính:
 - `StreamingAsrBackend.transcribe(SpeechSegment, language) -> AsrUpdate`
 - `CommitPolicy.update(AsrUpdate) -> CommittedTranscript | None`
 - `TranslationBackend.translate(TranslationRequest) -> TranslationUpdate`
+- `TtsBackend.synthesize(TtsRequest) -> TtsUpdate`
 - `VadBackend.process(AudioChunk) -> list[SpeechSegment]`
 - `VadBackend.request_endpoint() -> None` (tín hiệu thread-safe; audio worker mới thực sự đóng utterance)
 
 Queue audio/ASR/MT đều có giới hạn. Khi audio overload, pipeline phát event, bỏ utterance bị đứt và reset generation để kết quả cũ không lọt xuống MT. Translation có revision guard để bỏ kết quả đã stale.
 
-Mặc định pipeline tự đóng utterance khi stable/committed có đủ 2 câu hoàn chỉnh. Chỉnh `vad.semantic_endpoint_sentences`, hoặc đặt `vad.semantic_endpoint_enabled: false` để chỉ dùng khoảng lặng VAD và `max_utterance_seconds`. Đây là heuristic theo dấu `. ! ? 。 ！ ？`; điểm cắt audio xảy ra ngay sau khi ASR xác nhận ngưỡng nên có thể dư một đoạn ngắn do độ trễ inference.
+Mặc định pipeline tự đóng utterance khi stable/committed có đủ 2 câu hoàn chỉnh và không còn fragment câu tiếp theo. Chỉnh `vad.semantic_endpoint_sentences`, hoặc đặt `vad.semantic_endpoint_enabled: false` để chỉ dùng khoảng lặng VAD và `max_utterance_seconds`. Sentence boundary dùng chung splitter với MT/TTS; điểm cắt audio xảy ra ngay sau khi ASR xác nhận ngưỡng nên có thể dư một đoạn ngắn do độ trễ inference.
+
+TTS phrase chỉ được commit sau khi synthesis thành công và consumer chấp nhận audio vào playback queue. TTS worker kiểm tra revision trước và sau synthesis; request bị queue drop, model lỗi hoặc stale sẽ được cancel thay vì bị coi nhầm là đã phát.
 
 ## Streamlit microphone
 
@@ -125,4 +136,6 @@ Theo dõi ASR latency, MT latency và thời gian từ lúc nói đến output �
 - [M2M100-418M](https://huggingface.co/facebook/m2m100_418M): MIT, hỗ trợ trực tiếp cả 12 hướng giữa bốn ngôn ngữ.
 - `streamlit-webrtc`: MIT.
 
-V1 chưa gồm TTS, model khử nhiễu, glossary, mobile packaging hoặc Qualcomm QNN. `AudioPreprocessor` và backend registry là điểm cắm cho các phase sau.
+MT dùng hybrid wait-k: sentence boundary là trigger ưu tiên, nhưng partial vẫn chạy sau mỗi cụm token ổn định hoặc timeout để subtitle không phải chờ hết câu. Pending partial cùng utterance được coalesce latest-only; final đi qua lane lossless. Partial MT dịch toàn prefix một lần, còn final được dịch theo từng câu và giữ dấu kết thúc để giảm bỏ sót. TTS mặc định `final_utterance`, dùng phrase 8–24 token với hard maximum; UI ghép toàn bộ phrase của một utterance thành một audio trước khi autoplay. VAD semantic endpoint và TTS emission là hai policy độc lập. Backend `sherpa_onnx` tự chọn voice theo target language, tải lần đầu vào `.cache/onevoice/tts` và tái sử dụng cache; UI không yêu cầu đường dẫn model. `offline: true` sẽ fail sớm nếu voice chưa được cache.
+
+Các profile mẫu nằm trong `config/realtime_conversation.yaml` (endpoint 1 câu), `config/continuous_speech.yaml` (2 câu) và `config/stable_demo.yaml` (agreement bảo thủ hơn). Truyền profile bằng `onevoice sample.wav --config config/<profile>.yaml`; profile được deep-merge lên `config/default.yaml`, nên field không khai báo vẫn giữ nguyên model/language/device/cache mặc định.

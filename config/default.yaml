@@ -35,8 +35,37 @@ translation:
   model_dir: null
   source_language: vi
   target_language: en
-  wait_tokens: 3
-  update_tokens: 3
-  timeout_ms: 800
+  wait_tokens: 6
+  update_tokens: 4
+  timeout_ms: 1200
+  min_request_interval_ms: 500
+  zh_wait_tokens: 12
+  zh_update_tokens: 8
+  zh_timeout_ms: 1000
   max_new_tokens: 256
+  sentence_boundary_only: false
   offline: false
+tts:
+  enabled: false
+  backend: sherpa_onnx
+  model: auto
+  model_dir: null
+  tokens: null
+  lexicon: null
+  data_dir: null
+  rule_fsts: []
+  language: auto
+  cache_dir: .cache/onevoice/tts
+  offline: false
+  device: cpu
+  num_threads: 2
+  speaker_id: 0
+  speed: 0.9
+  num_steps: 8
+  min_chunk_tokens: 8
+  max_chunk_tokens: 24
+  agreement_updates: 2
+  timeout_ms: 1200
+  sentence_boundary_only: true
+  final_only: true
+  emission_mode: final_utterance

@@ -46,7 +46,7 @@ def test_final_revision_does_not_discard_visible_draft_suffix() -> None:
     assert committer.update(update(draft, 1)) is None
     committed = committer.update(update(draft, 2))
     assert committed is not None
-    assert committed.text.endswith("inflation rose")
+    assert committed.text == draft
 
     # The final pass revises the beginning. The previous implementation fell
     # back to the committed prefix and lost the visible sentence suffix.
@@ -60,3 +60,33 @@ def test_final_revision_does_not_discard_visible_draft_suffix() -> None:
     assert final is not None
     assert final.is_final
     assert final.text == draft
+
+
+def test_current_sentence_can_revise_without_rewriting_locked_sentence() -> None:
+    committer = LocalAgreementCommitter(CommitConfig(agreement_updates=2, hold_tokens=1))
+    old = "It's one another in a car park. When they"
+
+    assert committer.update(update(old, 1)) is None
+    first_stable = committer.update(update(old, 2))
+    assert first_stable is not None
+    assert first_stable.text == "It's one another in a car park. When"
+
+    corrected = "to one another in a car park when they're the only two vehicles there"
+    assert committer.update(update(corrected, 3)) is None
+    revised = committer.update(update(corrected, 4))
+
+    assert revised is not None
+    assert not revised.is_final
+    assert revised.text.startswith("It's one another in a car park.")
+    assert revised.text.endswith("when they're the only two vehicles")
+    assert "When they" not in revised.text
+
+
+def test_agreed_terminal_mark_is_not_hidden_by_hold_tokens() -> None:
+    committer = LocalAgreementCommitter(CommitConfig(agreement_updates=2, hold_tokens=1))
+
+    assert committer.update(update("Sentence one.", 1)) is None
+    stable = committer.update(update("Sentence one.", 2))
+
+    assert stable is not None
+    assert stable.text == "Sentence one."
