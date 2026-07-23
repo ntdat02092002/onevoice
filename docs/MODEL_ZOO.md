@@ -127,10 +127,12 @@ tts:
   sentence_boundary_only: true
   final_only: true
   emission_mode: final_utterance
-  timeout_ms: 700
+  timeout_ms: 1200
 ```
 
 `language: auto` được pipeline resolve thành target language. Bật `offline: true` chỉ sau khi voice đã có trong cache. `model_dir` và các tên asset vẫn được backend hỗ trợ cho custom voice nhưng là advanced YAML override, không xuất hiện trên UI.
+
+Đây là global default an toàn: `final_utterance`. Streamlit load `config/realtime_conversation.yaml`, override thành `stable_sentence`, `final_only: false`, `sentence_boundary_only: true`, `agreement_updates: 2`. Target sentence phải hoàn chỉnh và đồng thuận qua hai translation revisions; final flush tail còn lại. UI autoplay từng câu, chỉ ghép các internal chunk nếu câu vượt hard maximum 24 token.
 
 ## VAD và endpoint
 
@@ -153,15 +155,15 @@ vad:
   semantic_endpoint_sentences: 2
 ```
 
-Semantic endpoint đóng utterance khi stable/committed có đủ số câu hoàn chỉnh và không còn fragment câu tiếp theo. Đặt `semantic_endpoint_enabled: false` để chỉ dùng silence/max-duration endpoint.
+Semantic endpoint đóng utterance khi stable/committed có đủ số câu hoàn chỉnh và cả stable text lẫn ASR hypothesis mới nhất đều kết thúc tại sentence boundary. Vì vậy fragment câu tiếp theo chưa hoàn chỉnh không bị cắt. Terminal mark đã vượt Local Agreement được publish dù `hold_tokens=1`, tạo cửa sổ endpoint thực sự. Đặt `semantic_endpoint_enabled: false` để chỉ dùng silence/max-duration endpoint.
 
 ## Audio preprocessing, commit và translation policy
 
 | Kind | Backend | Trạng thái hiện tại |
 |---|---|---|
 | `preprocessor` | `passthrough` | Không đổi samples; điểm cắm RNNoise/GTCRN sau này |
-| `commit` | `local_agreement` | LA-2 + Hold-1 mặc định; final không làm mất suffix draft |
-| translation policy | `WaitKTranslationPolicy` | Bắt đầu sau 3 token; update mỗi 3 token, dấu câu hoặc timeout 800 ms |
+| `commit` | `local_agreement` | LA-2 + Hold-1; lock completed sentence, cho phép current fragment revision |
+| translation policy | `WaitKTranslationPolicy` | Wait 6 token; update mỗi 4 token, boundary hoặc timeout 1200 ms; minimum interval 500 ms |
 
 Các option mặc định:
 
@@ -172,10 +174,25 @@ commit:
   hold_tokens: 1
 
 translation:
-  wait_tokens: 3
-  update_tokens: 3
-  timeout_ms: 800
+  wait_tokens: 6
+  update_tokens: 4
+  timeout_ms: 1200
+  min_request_interval_ms: 500
+  sentence_boundary_only: false
 ```
+
+Local Agreement chỉ làm immutable các completed sentence. Fragment của current sentence vẫn mutable: nếu ASR sửa token đầu, policy chờ đủ agreement rồi emit revision mới thay vì freeze đến final. MT queue/revision guard nhận các revision này và chỉ giữ pending partial mới nhất.
+
+## Streamlit realtime và metric file
+
+Streamlit dùng realtime profile (semantic endpoint 1 câu và TTS `stable_sentence`). File feeder pace theo absolute media timeline để sai số scheduler của từng frame không cộng dồn. Khi hoàn tất, UI tạo player cùng file WAV TTS toàn bộ và hiển thị:
+
+- input/output duration và realtime feed drift;
+- input start/end, output playback start, TTS synthesis finish;
+- `End-to-end elapsed`, bao gồm thời lượng media;
+- ASR `input end -> final`, MT `ASR final -> MT final`, TTS `MT final -> ready`, và `Total after input`.
+
+Các stage chạy overlap nên giá trị âm được clamp về `0 ms`. `TTS finished at` không phải playback end; nếu output duration dài hơn input thì người nghe vẫn có playback tail.
 
 ## Recipe đề xuất
 
