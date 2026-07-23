@@ -17,6 +17,7 @@ OPUS_PAIR_MODELS = {
     ("en", "zh"): "Helsinki-NLP/opus-mt-en-zh",
     ("ko", "en"): "Helsinki-NLP/opus-mt-ko-en",
     ("en", "ko"): "Helsinki-NLP/opus-mt-tc-big-en-ko",
+    ("zh", "vi"): "Helsinki-NLP/opus-mt-zh-vi",
 }
 SUPPORTED_TRANSLATION_LANGUAGES = frozenset(("vi", "en", "zh", "ko"))
 
