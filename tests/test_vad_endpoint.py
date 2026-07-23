@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from onevoice.backends.vad import PassthroughVad, WebRtcVadBackend
 from onevoice.config import AudioConfig, VadConfig
@@ -45,21 +46,66 @@ def test_passthrough_vad_honors_requested_endpoint() -> None:
     assert segments[0].samples.size == 640
 
 
-def test_pipeline_requests_endpoint_after_configured_sentence_count() -> None:
+def _pipeline_with_semantic_threshold(sentences: int) -> tuple[RealtimePipeline, PassthroughVad]:
     from onevoice.config import PipelineConfig
 
     config = PipelineConfig()
     config.vad.backend = "passthrough"
+    config.vad.semantic_endpoint_sentences = sentences
     vad = PassthroughVad(config.vad, config.audio)
-    pipeline = RealtimePipeline(config, vad=vad)
-    committed = CommittedTranscript(
-        "One. Two? unfinished",
+    return RealtimePipeline(config, vad=vad), vad
+
+
+def _committed(text: str, revision: int = 1) -> CommittedTranscript:
+    from onevoice.text import tokenize_text
+
+    return CommittedTranscript(
+        text,
         "en",
-        revision=3,
+        revision=revision,
         is_final=False,
-        tokens=("One", ".", "Two", "?", "unfinished"),
+        tokens=tokenize_text(text, "en"),
     )
 
-    pipeline._maybe_request_semantic_endpoint(committed)
+
+def test_pipeline_requests_endpoint_after_configured_sentence_count() -> None:
+    pipeline, vad = _pipeline_with_semantic_threshold(2)
+    pipeline._maybe_request_semantic_endpoint(_committed("One. Two?"))
 
     assert vad._endpoint_requested.is_set()
+
+
+@pytest.mark.parametrize(
+    ("threshold", "text"),
+    [(1, "One. unfinished"), (2, "One. Two? unfinished")],
+)
+def test_pipeline_does_not_endpoint_with_trailing_fragment(
+    threshold: int, text: str
+) -> None:
+    pipeline, vad = _pipeline_with_semantic_threshold(threshold)
+    pipeline._maybe_request_semantic_endpoint(_committed(text))
+
+    assert not vad._endpoint_requested.is_set()
+
+
+@pytest.mark.parametrize(
+    ("threshold", "text"),
+    [(1, "One."), (2, "One. Two? First, I'm ready.")],
+)
+def test_pipeline_endpoints_when_threshold_met_without_trailing_fragment(
+    threshold: int, text: str
+) -> None:
+    pipeline, vad = _pipeline_with_semantic_threshold(threshold)
+    pipeline._maybe_request_semantic_endpoint(_committed(text))
+
+    assert vad._endpoint_requested.is_set()
+
+
+def test_pipeline_does_not_endpoint_when_latest_asr_hypothesis_has_started_tail() -> None:
+    pipeline, vad = _pipeline_with_semantic_threshold(1)
+
+    pipeline._maybe_request_semantic_endpoint(
+        _committed("One."), active_hypothesis="One. unfinished"
+    )
+
+    assert not vad._endpoint_requested.is_set()

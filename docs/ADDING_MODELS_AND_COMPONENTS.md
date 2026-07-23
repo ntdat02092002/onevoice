@@ -16,6 +16,9 @@ AudioChunk
   -> WaitKTranslationPolicy
   -> TranslationBackend
   -> TranslationUpdate
+  -> PhraseTtsPolicy
+  -> TtsBackend
+  -> TtsUpdate
 ```
 
 Các contract nằm trong `src/onevoice/protocols.py`, kiểu dữ liệu chung nằm trong `src/onevoice/models.py`, và backend tích hợp sẵn được đăng ký tại `src/onevoice/backends/__init__.py`.
@@ -27,6 +30,7 @@ Các contract nằm trong `src/onevoice/protocols.py`, kiểu dữ liệu chung 
 | `asr` | `transcribe(SpeechSegment, language) -> AsrUpdate` | `config` |
 | `commit` | `update(AsrUpdate) -> CommittedTranscript | None` | `config` |
 | `translation` | `translate(TranslationRequest) -> TranslationUpdate` | `config` |
+| `tts` | `synthesize(TtsRequest) -> TtsUpdate` | `config` |
 
 Mọi component đều phải có lifecycle:
 
@@ -258,6 +262,82 @@ Nếu dùng LLM SimulMT có KV cache:
 - `reset()` phải xóa history khi bắt đầu conversation mới hoặc pipeline overload;
 - không chuyển logic Wait-k vào adapter; policy và model vẫn phải thay độc lập được.
 
+### 4.1. Thêm TTS model/voice mới
+
+TTS nhận `TtsRequest` đã được `PhraseTtsPolicy` gom thành cụm. Adapter không tự cắt lại text và không phát audio trực tiếp; nó chỉ trả `TtsUpdate` chứa waveform mono `float32` cùng sample rate thật của model. Audio player/UI tiêu thụ event `tts_partial` hoặc `tts_final` ở tầng ngoài.
+
+Backend mặc định khi bật TTS là `SherpaOnnxTtsBackend`. Chế độ thông thường dùng catalog tự động; backend chọn voice từ target language và tải/cache asset giống các component model khác:
+
+```yaml
+tts:
+  enabled: true
+  backend: sherpa_onnx
+  model: auto
+  language: auto
+  cache_dir: .cache/onevoice/tts
+  offline: false
+```
+
+Muốn dùng custom VITS/Piper voice ngoài catalog mới cần advanced YAML override (field này không hiển thị trong UI):
+
+```yaml
+tts:
+  model: custom.onnx
+  model_dir: models/tts/my_voice
+  tokens: tokens.txt
+  lexicon: lexicon.txt
+  data_dir: null
+  rule_fsts: []
+  device: cpu
+  num_threads: 2
+  speaker_id: 0
+```
+
+Khi tích hợp một runtime TTS khác:
+
+```python
+class MyTtsBackend:
+    def __init__(self, config: TtsConfig) -> None: ...
+    def load(self) -> None: ...
+    def reset(self) -> None: ...
+    def close(self) -> None: ...
+    def synthesize(self, request: TtsRequest) -> TtsUpdate: ...
+```
+
+Đăng ký `("tts", "my_tts", MyTtsBackend)`. Các invariant bắt buộc:
+
+- output là `numpy.ndarray` một chiều, `float32`, không rỗng và không có `NaN/Inf`;
+- `sample_rate` là sample rate output thật, không ép về 16 kHz của ASR;
+- copy nguyên `text`, `language`, `source_revision`, `is_final`, `phrase_id` và `source_is_final` từ request;
+- validate asset trước khi import dependency nặng;
+- `speaker_id`/speaker embedding được cache; không tính lại ở từng phrase nếu runtime cho phép;
+- không phát lại cả translation prefix: việc chống lặp thuộc `PhraseTtsPolicy`.
+
+`PhraseTtsPolicy` global default dùng `emission_mode: final_utterance`. Profile `realtime_conversation.yaml` và Streamlit dùng `stable_sentence`: chỉ một target sentence hoàn chỉnh giống nhau qua số revision cấu hình mới được reserve; final vẫn flush tail chưa có punctuation. `stable_phrase` là mode chủ động hơn nhưng không phải realtime default. `max_chunk_tokens=24` là hard maximum kể cả ở final hoặc với câu dài; UI ghép các internal chunk của cùng một câu rồi autoplay ngay, không chờ toàn utterance. Hai field `final_only` và `sentence_boundary_only` vẫn được đọc khi `emission_mode: null` để tương thích config cũ. VAD semantic endpoint chỉ đóng waveform/utterance và không quyết định TTS stability.
+
+MT mặc định dùng hybrid wait-k: đủ context và gặp sentence boundary thì chạy ngay; nếu chưa hết câu, policy vẫn trigger theo `update_tokens` + minimum interval hoặc `timeout_ms`. Queue chỉ giữ pending partial mới nhất của mỗi utterance, nhưng giữ mọi final theo FIFO. Backend dịch partial prefix đúng một lần; chỉ final mới split theo sentence và phục hồi terminal punctuation.
+
+Vòng đời mỗi TTS phrase là `reserved -> synthesized -> acknowledged`:
+
+- policy chỉ reserve khi tạo `TtsRequest`, chưa coi phrase là đã phát;
+- TTS worker đánh dấu synthesized sau khi model trả waveform hợp lệ;
+- consumer gọi `pipeline.acknowledge_tts(phrase_id)` sau khi nhận audio vào playback queue;
+- request bị queue loại, model lỗi hoặc event không giao được sẽ bị cancel để revision sau có thể tạo lại.
+
+`phrase_id` phải được copy nguyên từ `TtsRequest` sang `TtsUpdate`. Worker kiểm tra generation và reservation trước/sau synthesis. TTS validity không dựa riêng vào revision number: reservation còn hợp lệ nếu exact translated prefix vẫn giữ nguyên ở revision mới; content phân kỳ sẽ cancel reservation chưa synthesize và suffix phụ thuộc. Completed stream được ghi nhận idempotently để duplicate final không mở state mới và phát lại. Lỗi ở translation final hoặc TTS reset state downstream của utterance tương ứng.
+
+### 4.2. Streamlit playback và benchmark file
+
+Streamlit nhận `tts_partial`/`tts_final`, đưa từng câu hoàn chỉnh vào playback queue rồi mới gọi `acknowledge_tts()`. Event trùng `phrase_id` bị bỏ qua. Với file upload, UI còn:
+
+- pace input theo absolute media deadline, không `sleep(frame_duration)` cộng dồn qua từng frame;
+- ghép toàn bộ waveform TTS và xuất WAV mono PCM16;
+- đo input/output duration, input start/end, output playback start và thời điểm chunk TTS cuối synthesize xong;
+- tách `End-to-end elapsed` (bao gồm media duration) khỏi `Total after input` và ASR/MT/TTS final-tail latency;
+- hiển thị realtime feed drift để phát hiện feeder chậm dù inference latency thấp.
+
+`TTS finished at` là lúc synthesis hoàn tất, không phải lúc browser phát hết waveform. Nếu output duration dài hơn input, playback tail vẫn có thể kéo dài sau thời điểm này.
+
 ## 5. Thêm audio preprocessor
 
 Preprocessor phù hợp cho noise suppression, automatic gain control, high-pass filter hoặc echo cancellation. Nó không nên tự cắt utterance; việc đó thuộc VAD.
@@ -341,12 +421,15 @@ class MyVadBackend:
 
 Không gọi ASR trực tiếp từ VAD. Pipeline sẽ đưa `SpeechSegment` sang ASR queue và tự xử lý backpressure. `request_endpoint()` được dùng bởi semantic endpoint cấu hình qua `vad.semantic_endpoint_enabled` và `vad.semantic_endpoint_sentences`.
 
-## 7. Thêm Stable Prefix / commit policy
+## 7. Thêm Local Agreement / commit policy
 
 Commit policy chỉ xử lý text hypothesis, không biết model ASR cụ thể. Một policy mới phải:
 
 - không emit lại cùng stable text nếu không có thay đổi;
-- giữ committed partial đơn điệu; final được phép thay thế utterance hiện tại nếu ASR sửa prefix, nhưng không được làm mất suffix draft đã hiển thị;
+- tách completed sentences đã lock khỏi fragment của current sentence;
+- không rewrite completed sentence đã lock, nhưng cho phép current fragment revision sau đủ `agreement_updates` để prefix mismatch không làm stable transcript freeze;
+- dùng cùng sentence segmentation helper với MT/TTS; terminal punctuation đã đồng thuận không bị `hold_tokens` giấu, nhờ đó semantic endpoint có cửa sổ chốt câu;
+- final flush đầy đủ tail và không làm mất suffix draft đã hiển thị;
 - flush khi `AsrUpdate.is_final=True`;
 - tokenize đúng ngôn ngữ, đặc biệt tiếng Trung không dựa vào khoảng trắng;
 - reset toàn bộ history khi `reset()`.
@@ -410,6 +493,7 @@ translation_final
 Đánh dấu bằng `@pytest.mark.model` để không chạy mặc định. Benchmark ít nhất:
 
 - TTFT/latency và real-time factor;
+- time-to-first-output, realtime feed drift, post-input ASR/MT/TTS tail và playback tail;
 - RAM peak;
 - reset giữa hai utterance;
 - bốn ngôn ngữ hoặc đúng phạm vi model công bố;
@@ -439,13 +523,13 @@ Chạy kiểm tra:
 
 ## 11. Khi thêm component hoàn toàn mới
 
-Ví dụ TTS không nên được nhét vào `TranslationBackend`. Hãy mở rộng theo đúng tầng:
+TTS là ví dụ đã triển khai cho quy trình mở rộng đúng tầng. Với component mới tiếp theo:
 
 1. Thêm request/result dataclass mới vào `models.py`.
 2. Thêm protocol mới vào `protocols.py`.
 3. Thêm registry kind và adapter.
 4. Thêm bounded queue/worker mới sau MT.
 5. Thêm `EventType` và UI consumer.
-6. Viết fake backend trước, sau đó mới nối model thật.
+6. Viết fake backend trước, sau đó mới nối model thật. Có thể tham khảo `FakeTtsBackend`, `_TtsJob` và `_tts_worker`.
 
 Cách này giữ ranh giới module rõ ràng và cho phép tắt/thay TTS mà không làm thay đổi ASR hoặc MT.

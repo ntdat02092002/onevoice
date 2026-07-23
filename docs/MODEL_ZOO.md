@@ -93,6 +93,47 @@ License thay đổi theo pair/model card. Các pair Việt–Anh và phần lớ
 - Nặng và thường chậm hơn OPUS INT8 trên CPU, nhưng giữ context qua một model multilingual duy nhất.
 - Hỗ trợ CPU/CUDA qua PyTorch; license model: MIT.
 
+## Text-to-Speech
+
+| Backend | Model | Streaming trong OneVoice | Dependency |
+|---|---|---|---|
+| `sherpa_onnx` | Piper/VITS hoặc Supertonic 3 INT8 | Sentence-aware phrase 8–24 token, worker/queue riêng | `tts` |
+| `fake` | Tone kiểm thử | Giả lập | Không |
+
+`sherpa_onnx` là lựa chọn mặc định khi bật TTS vì phù hợp khuyến nghị offline/edge của report. Với `model: auto`, backend chọn voice theo ngôn ngữ đích, tải một lần từ release chính thức vào `.cache/onevoice/tts` và tái sử dụng cache. UI không yêu cầu đường dẫn model.
+
+| Target | Voice auto | Loại |
+|---|---|---|
+| `vi` | `vits-piper-vi_VN-25hours_single-low` | Piper/VITS 16 kHz |
+| `en` | `vits-piper-en_US-amy-low` | Piper/VITS 16 kHz |
+| `zh` | `vits-piper-zh_CN-chaowen-medium` | Piper/VITS 22.05 kHz |
+| `ko` | `sherpa-onnx-supertonic-3-tts-int8-2026-05-11` | Supertonic 3 INT8 24 kHz |
+
+```yaml
+tts:
+  enabled: true
+  backend: sherpa_onnx
+  model: auto
+  language: auto
+  cache_dir: .cache/onevoice/tts
+  offline: false
+  device: cpu
+  num_threads: 2
+  speaker_id: 0
+  speed: 0.9
+  min_chunk_tokens: 8
+  max_chunk_tokens: 24
+  agreement_updates: 2
+  sentence_boundary_only: true
+  final_only: true
+  emission_mode: final_utterance
+  timeout_ms: 1200
+```
+
+`language: auto` được pipeline resolve thành target language. Bật `offline: true` chỉ sau khi voice đã có trong cache. `model_dir` và các tên asset vẫn được backend hỗ trợ cho custom voice nhưng là advanced YAML override, không xuất hiện trên UI.
+
+Đây là global default an toàn: `final_utterance`. Streamlit load `config/realtime_conversation.yaml`, override thành `stable_sentence`, `final_only: false`, `sentence_boundary_only: true`, `agreement_updates: 2`. Target sentence phải hoàn chỉnh và đồng thuận qua hai translation revisions; final flush tail còn lại. UI autoplay từng câu, chỉ ghép các internal chunk nếu câu vượt hard maximum 24 token.
+
 ## VAD và endpoint
 
 | Backend | Option | Mục đích |
@@ -114,15 +155,15 @@ vad:
   semantic_endpoint_sentences: 2
 ```
 
-Semantic endpoint đóng utterance khi stable/committed có đủ số câu hoàn chỉnh. Đặt `semantic_endpoint_enabled: false` để chỉ dùng silence/max-duration endpoint.
+Semantic endpoint đóng utterance khi stable/committed có đủ số câu hoàn chỉnh và cả stable text lẫn ASR hypothesis mới nhất đều kết thúc tại sentence boundary. Vì vậy fragment câu tiếp theo chưa hoàn chỉnh không bị cắt. Terminal mark đã vượt Local Agreement được publish dù `hold_tokens=1`, tạo cửa sổ endpoint thực sự. Đặt `semantic_endpoint_enabled: false` để chỉ dùng silence/max-duration endpoint.
 
 ## Audio preprocessing, commit và translation policy
 
 | Kind | Backend | Trạng thái hiện tại |
 |---|---|---|
 | `preprocessor` | `passthrough` | Không đổi samples; điểm cắm RNNoise/GTCRN sau này |
-| `commit` | `local_agreement` | LA-2 + Hold-1 mặc định; final không làm mất suffix draft |
-| translation policy | `WaitKTranslationPolicy` | Bắt đầu sau 3 token; update mỗi 3 token, dấu câu hoặc timeout 800 ms |
+| `commit` | `local_agreement` | LA-2 + Hold-1; lock completed sentence, cho phép current fragment revision |
+| translation policy | `WaitKTranslationPolicy` | Wait 6 token; update mỗi 4 token, boundary hoặc timeout 1200 ms; minimum interval 500 ms |
 
 Các option mặc định:
 
@@ -133,10 +174,25 @@ commit:
   hold_tokens: 1
 
 translation:
-  wait_tokens: 3
-  update_tokens: 3
-  timeout_ms: 800
+  wait_tokens: 6
+  update_tokens: 4
+  timeout_ms: 1200
+  min_request_interval_ms: 500
+  sentence_boundary_only: false
 ```
+
+Local Agreement chỉ làm immutable các completed sentence. Fragment của current sentence vẫn mutable: nếu ASR sửa token đầu, policy chờ đủ agreement rồi emit revision mới thay vì freeze đến final. MT queue/revision guard nhận các revision này và chỉ giữ pending partial mới nhất.
+
+## Streamlit realtime và metric file
+
+Streamlit dùng realtime profile (semantic endpoint 1 câu và TTS `stable_sentence`). File feeder pace theo absolute media timeline để sai số scheduler của từng frame không cộng dồn. Khi hoàn tất, UI tạo player cùng file WAV TTS toàn bộ và hiển thị:
+
+- input/output duration và realtime feed drift;
+- input start/end, output playback start, TTS synthesis finish;
+- `End-to-end elapsed`, bao gồm thời lượng media;
+- ASR `input end -> final`, MT `ASR final -> MT final`, TTS `MT final -> ready`, và `Total after input`.
+
+Các stage chạy overlap nên giá trị âm được clamp về `0 ms`. `TTS finished at` không phải playback end; nếu output duration dài hơn input thì người nghe vẫn có playback tail.
 
 ## Recipe đề xuất
 
@@ -152,6 +208,9 @@ translation:
   backend: opus_ct2
   model: opus-auto
   target_language: vi
+tts:
+  enabled: true
+  backend: fake
   device: cpu
   compute_type: int8
 ```
@@ -204,6 +263,9 @@ python -m pip install -e ".[dolphin,app]"
 
 # Faster-Whisper hoặc M2M100
 python -m pip install -e ".[models,app]"
+
+# TTS VITS/Piper qua sherpa-onnx
+python -m pip install -e ".[tts,app]"
 
 # Tất cả backend
 python -m pip install -e ".[all,app]"

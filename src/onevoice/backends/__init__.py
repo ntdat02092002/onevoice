@@ -6,6 +6,7 @@ from .asr import DolphinAsrBackend, FakeAsrBackend, FasterWhisperBackend, Moonsh
 from .commit import LocalAgreementCommitter
 from .preprocess import PassthroughPreprocessor
 from .translation import FakeTranslationBackend, M2M100Backend, OpusMtCTranslate2Backend
+from .tts import FakeTtsBackend, SherpaOnnxTtsBackend
 from .vad import PassthroughVad, WebRtcVadBackend
 
 
@@ -22,6 +23,8 @@ def register_builtin_backends() -> None:
         ("translation", "m2m100", M2M100Backend),
         ("translation", "opus_ct2", OpusMtCTranslate2Backend),
         ("translation", "fake", FakeTranslationBackend),
+        ("tts", "sherpa_onnx", SherpaOnnxTtsBackend),
+        ("tts", "fake", FakeTtsBackend),
     )
     for kind, name, factory in registrations:
         if name not in registry.names(kind):

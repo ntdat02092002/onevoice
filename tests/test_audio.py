@@ -1,8 +1,10 @@
+import io
 import wave
 
 import numpy as np
+import pytest
 
-from onevoice.audio import iter_audio_file
+from onevoice.audio import RealtimePacer, encode_wav, iter_audio_file
 from onevoice.models import AudioChunk
 
 
@@ -32,3 +34,22 @@ def test_wav_file_is_decoded_to_fixed_mono_chunks(tmp_path) -> None:
     assert chunks
     assert sum(len(chunk.samples) for chunk in chunks) == 1600
     assert all(chunk.samples.ndim == 1 for chunk in chunks)
+
+
+def test_encode_wav_creates_mono_pcm_with_expected_duration() -> None:
+    payload = encode_wav(np.zeros(8_000, dtype=np.float32), 16_000)
+
+    with wave.open(io.BytesIO(payload), "rb") as wav:
+        assert wav.getnchannels() == 1
+        assert wav.getsampwidth() == 2
+        assert wav.getframerate() == 16_000
+        assert wav.getnframes() == 8_000
+
+
+def test_realtime_pacer_compensates_previous_sleep_drift() -> None:
+    pacer = RealtimePacer(started_at=10.0)
+
+    assert pacer.delay_after(0.02, now=10.0) == pytest.approx(0.02)
+    # The first frame ran 5 ms late, so the second sleep is shortened rather
+    # than adding another full 20 ms and accumulating drift across the file.
+    assert pacer.delay_after(0.02, now=10.025) == pytest.approx(0.015)

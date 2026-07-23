@@ -7,6 +7,7 @@ from typing import Any
 
 from onevoice.config import TranslationConfig
 from onevoice.models import TranslationRequest, TranslationUpdate
+from onevoice.text import restore_terminal_punctuation, split_sentences
 
 
 OPUS_PAIR_MODELS = {
@@ -232,9 +233,28 @@ class OpusMtCTranslate2Backend:
     def translate(self, request: TranslationRequest) -> TranslationUpdate:
         route = self._ensure_route(request.source_language, request.target_language)
         started = monotonic()
-        text = request.text
-        for pair in route:
-            text = self._translate_once(text, pair)
+        translated_sentences: list[str] = []
+        source_sentences = (
+            split_sentences(request.text, request.source_language)
+            if request.is_final
+            else (request.text,)
+        ) or (request.text,)
+        for source_sentence in source_sentences:
+            text = source_sentence
+            for pair in route:
+                text = self._translate_once(text, pair)
+            translated_sentences.append(
+                restore_terminal_punctuation(
+                    source_sentence,
+                    text,
+                    request.source_language,
+                    request.target_language,
+                )
+                if request.is_final
+                else text
+            )
+        separator = "" if request.target_language == "zh" else " "
+        text = separator.join(translated_sentences)
         return TranslationUpdate(
             text=text,
             source_text=request.text,
@@ -284,17 +304,36 @@ class M2M100Backend:
         if self._model is None or self._tokenizer is None or self._torch is None:
             self.load()
         started = monotonic()
-        self._tokenizer.src_lang = request.source_language
-        encoded = self._tokenizer(request.text, return_tensors="pt", truncation=True)
-        encoded = {key: value.to(self._device) for key, value in encoded.items()}
-        with self._torch.inference_mode():
-            generated = self._model.generate(
-                **encoded,
-                forced_bos_token_id=self._tokenizer.get_lang_id(request.target_language),
-                max_new_tokens=self.config.max_new_tokens,
-                num_beams=1,
+        translated_sentences: list[str] = []
+        source_sentences = (
+            split_sentences(request.text, request.source_language)
+            if request.is_final
+            else (request.text,)
+        ) or (request.text,)
+        for source_sentence in source_sentences:
+            self._tokenizer.src_lang = request.source_language
+            encoded = self._tokenizer(source_sentence, return_tensors="pt", truncation=True)
+            encoded = {key: value.to(self._device) for key, value in encoded.items()}
+            with self._torch.inference_mode():
+                generated = self._model.generate(
+                    **encoded,
+                    forced_bos_token_id=self._tokenizer.get_lang_id(request.target_language),
+                    max_new_tokens=self.config.max_new_tokens,
+                    num_beams=1,
+                )
+            text = self._tokenizer.batch_decode(generated, skip_special_tokens=True)[0].strip()
+            translated_sentences.append(
+                restore_terminal_punctuation(
+                    source_sentence,
+                    text,
+                    request.source_language,
+                    request.target_language,
+                )
+                if request.is_final
+                else text
             )
-        text = self._tokenizer.batch_decode(generated, skip_special_tokens=True)[0].strip()
+        separator = "" if request.target_language == "zh" else " "
+        text = separator.join(translated_sentences)
         return TranslationUpdate(
             text=text,
             source_text=request.text,

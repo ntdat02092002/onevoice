@@ -2,7 +2,16 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from .models import AsrUpdate, AudioChunk, CommittedTranscript, SpeechSegment, TranslationRequest, TranslationUpdate
+from .models import (
+    AsrUpdate,
+    AudioChunk,
+    CommittedTranscript,
+    SpeechSegment,
+    TranslationRequest,
+    TranslationUpdate,
+    TtsRequest,
+    TtsUpdate,
+)
 
 
 @runtime_checkable
@@ -37,3 +46,8 @@ class CommitPolicy(Lifecycle, Protocol):
 @runtime_checkable
 class TranslationBackend(Lifecycle, Protocol):
     def translate(self, request: TranslationRequest) -> TranslationUpdate: ...
+
+
+@runtime_checkable
+class TtsBackend(Lifecycle, Protocol):
+    def synthesize(self, request: TtsRequest) -> TtsUpdate: ...
