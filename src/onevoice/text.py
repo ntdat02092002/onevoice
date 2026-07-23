@@ -6,10 +6,10 @@ from collections.abc import Sequence
 
 _WORD_OR_PUNCT = re.compile(r"\w+(?:['’-]\w+)*|[^\w\s]", re.UNICODE)
 _CJK_OR_PUNCT = re.compile(r"[^\s]", re.UNICODE)
-_NO_SPACE_BEFORE = set(",.!?;:%)]}、。，！？；：）】》")
-_NO_SPACE_AFTER = set("([{（【《")
-_TERMINAL_MARKS = {".", "!", "?", "。", "！", "？"}
-_CLOSING_MARKS = set("\"'”’)]}）】》")
+_NO_SPACE_BEFORE = set(",.!?;:%)]}、。，！？；：…）】》」』")
+_NO_SPACE_AFTER = set("([{（【《「『")
+_TERMINAL_MARKS = {".", "!", "?", "。", "！", "？", "…"}
+_CLOSING_MARKS = set("\"'”’)]}）】》」』")
 _NON_TERMINAL_ABBREVIATIONS = {
     "mr",
     "mrs",
@@ -110,8 +110,8 @@ def _sentence_boundaries(text: str) -> tuple[int, ...]:
     index = 0
     while index < len(text):
         mark = text[index]
-        boundary = mark in {"!", "?", "。", "！", "？"} or (
-            mark == "." and _period_is_boundary(text, index)
+        boundary = mark in _TERMINAL_MARKS and (
+            mark != "." or _period_is_boundary(text, index)
         )
         if not boundary:
             index += 1

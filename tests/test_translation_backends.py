@@ -4,7 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from onevoice.backends.translation import OpusMtCTranslate2Backend, _OpusEngine
+from onevoice.backends.translation import (
+    M2M100Backend,
+    OpusMtCTranslate2Backend,
+    _M2M100Engine,
+    _OpusEngine,
+)
 from onevoice.config import TranslationConfig
 from onevoice.models import TranslationRequest
 
@@ -124,6 +129,79 @@ def test_opus_translates_partial_prefix_once_without_sentence_loop() -> None:
 
     assert calls == ["Sentence one. Sentence two. active"]
     assert result.text == "partial result"
+
+
+class _M2MTokenizer:
+    lang_code_to_token = {"vi": "__vi__"}
+
+    def __init__(self) -> None:
+        self.src_lang = None
+        self.encoded = None
+
+    def encode(self, text: str):
+        self.encoded = text
+        return [1, 2]
+
+    def convert_ids_to_tokens(self, values):
+        return [f"s{value}" for value in values]
+
+    def convert_tokens_to_ids(self, values):
+        assert values == ["translated"]
+        return [3]
+
+    def decode(self, values, skip_special_tokens: bool):
+        assert values == [3]
+        assert skip_special_tokens
+        return "đã dịch"
+
+
+class _M2MTranslator:
+    def __init__(self) -> None:
+        self.sources = None
+        self.kwargs = None
+
+    def translate_batch(self, sources, **kwargs):
+        self.sources = sources
+        self.kwargs = kwargs
+        return [SimpleNamespace(hypotheses=[["__vi__", "translated"]])]
+
+
+def test_m2m100_uses_ct2_target_prefix_and_strips_forced_language_token() -> None:
+    backend = M2M100Backend(
+        TranslationConfig(backend="m2m100", model="facebook/m2m100_418M", max_new_tokens=64)
+    )
+    tokenizer = _M2MTokenizer()
+    translator = _M2MTranslator()
+    backend._engine = _M2M100Engine(tokenizer, translator)
+
+    assert backend._translate_once("hello", "en", "vi") == "đã dịch"
+    assert tokenizer.src_lang == "en"
+    assert tokenizer.encoded == "hello"
+    assert translator.sources == [["s1", "s2"]]
+    assert translator.kwargs["target_prefix"] == [["__vi__"]]
+    assert translator.kwargs["beam_size"] == 1
+    assert translator.kwargs["max_decoding_length"] == 65
+
+
+def test_m2m100_preserves_final_sentence_policy_and_metadata() -> None:
+    backend = M2M100Backend(
+        TranslationConfig(backend="m2m100", model="facebook/m2m100_418M")
+    )
+    calls: list[tuple[str, str, str]] = []
+
+    def translate_once(text: str, source: str, target: str) -> str:
+        calls.append((text, source, target))
+        return {"First.": "Đầu", "Second?": "Sau"}[text]
+
+    backend._translate_once = translate_once
+    update = backend.translate(
+        TranslationRequest("First. Second?", "en", "vi", 8, True)
+    )
+
+    assert calls == [("First.", "en", "vi"), ("Second?", "en", "vi")]
+    assert update.text == "Đầu. Sau?"
+    assert update.source_revision == 8
+    assert update.is_final
 
 
 def test_translation_capabilities_fail_before_model_loading() -> None:
