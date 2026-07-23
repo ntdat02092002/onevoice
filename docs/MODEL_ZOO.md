@@ -63,8 +63,8 @@ Ngôn ngữ sản phẩm:
 
 | Backend | Model config | Hướng dịch | Route | Dependency |
 |---|---|---:|---|---|
-| `opus_ct2` | bắt buộc `opus-auto` | 12 hướng giữa `vi/en/zh/ko` | Trực tiếp với English; cặp còn lại pivot qua English | `opus` |
-| `m2m100` | mặc định `facebook/m2m100_418M` | 12 hướng trực tiếp | Một model multilingual | `models` |
+| `opus_ct2` | bắt buộc `opus-auto` | 12 hướng giữa `vi/en/zh/ko` | Direct khi có pair model (`zh -> vi` gồm); hướng còn lại pivot qua English | `opus` |
+| `m2m100` | mặc định `facebook/m2m100_418M` | 12 hướng trực tiếp | Một model multilingual, CTranslate2 | `models` |
 | `fake` | tên model không rỗng | Giả lập | Thêm prefix target language | Không |
 
 Source và target phải khác nhau. `source_language=auto` chỉ có nghĩa MT nhận language do ASR phát hiện; MT không tự nghe audio để detect language.
@@ -79,10 +79,11 @@ Các pair model vật lý:
 | `en -> vi` | `Helsinki-NLP/opus-mt-en-vi` |
 | `zh -> en` | `Helsinki-NLP/opus-mt-zh-en` |
 | `en -> zh` | `Helsinki-NLP/opus-mt-en-zh` |
+| `zh -> vi` | `Helsinki-NLP/opus-mt-zh-vi` |
 | `ko -> en` | `Helsinki-NLP/opus-mt-ko-en` |
 | `en -> ko` | `Helsinki-NLP/opus-mt-tc-big-en-ko` |
 
-Ví dụ `vi -> ko` chạy `vi -> en -> ko`, nên load hai model và có thể kém nhanh/chính xác hơn hướng trực tiếp. Snapshot được tải và convert một lần vào `.cache/onevoice/opus_ct2`; các lần sau tái sử dụng CT2 model.
+Ví dụ `vi -> ko` chạy `vi -> en -> ko`, nên load hai model và có thể kém nhanh/chính xác hơn hướng trực tiếp. `zh -> vi` dùng pair trực tiếp trong catalog. Snapshot được tải và convert một lần vào `.cache/onevoice/opus_ct2`; các lần sau tái sử dụng CT2 model.
 
 License thay đổi theo pair/model card. Các pair Việt–Anh và phần lớn pair dùng Apache-2.0; `zh-en` và English→Korean có model dùng CC-BY-4.0. Kiểm tra model card trước khi phân phối thương mại.
 
@@ -90,8 +91,10 @@ License thay đổi theo pair/model card. Các pair Việt–Anh và phần lớ
 
 - Model mặc định: `facebook/m2m100_418M`.
 - Dịch trực tiếp đủ 12 hướng, không pivot qua English.
-- Nặng và thường chậm hơn OPUS INT8 trên CPU, nhưng giữ context qua một model multilingual duy nhất.
-- Hỗ trợ CPU/CUDA qua PyTorch; license model: MIT.
+- Hugging Face snapshot được convert theo `translation.compute_type` một lần vào `.cache/onevoice/m2m100_ct2`; source snapshot nằm trong `.cache/onevoice/m2m100_sources`.
+- Runtime dùng `ctranslate2.Translator` với M2M100 target-language prefix; không chạy PyTorch `generate()` cho từng request.
+- Model vẫn nặng hơn các pair OPUS nhỏ, nhưng chỉ load một multilingual engine và giữ route trực tiếp.
+- Hỗ trợ CPU/CUDA qua CTranslate2; conversion dependency nằm trong extra `models`; license model: MIT.
 
 ## Text-to-Speech
 

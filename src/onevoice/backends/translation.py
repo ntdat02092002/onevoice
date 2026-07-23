@@ -267,43 +267,175 @@ class OpusMtCTranslate2Backend:
         )
 
 
+@dataclass(slots=True)
+class _M2M100Engine:
+    tokenizer: Any
+    translator: Any
+
+
 class M2M100Backend:
+    """Multilingual M2M100 inference through a converted CTranslate2 model."""
+
     def __init__(self, config: TranslationConfig) -> None:
         validate_translation_selection(config, "m2m100")
         self.config = config
-        self._model = None
-        self._tokenizer = None
-        self._torch = None
-        self._device = config.device
+        self._ct2: Any = None
+        self._auto_tokenizer: Any = None
+        self._snapshot_download: Any = None
+        self._converter_type: Any = None
+        self._engine: _M2M100Engine | None = None
+
+    def _import_dependencies(self) -> None:
+        if self._ct2 is not None:
+            return
+        try:
+            import ctranslate2
+            from ctranslate2.converters import TransformersConverter
+            from huggingface_hub import snapshot_download
+            from transformers import AutoTokenizer
+        except ImportError as exc:
+            raise RuntimeError(
+                "Install the 'models' extra to use M2M100 with CTranslate2: "
+                "python -m pip install -e \".[models]\""
+            ) from exc
+        self._ct2 = ctranslate2
+        self._converter_type = TransformersConverter
+        self._snapshot_download = snapshot_download
+        self._auto_tokenizer = AutoTokenizer
 
     def load(self) -> None:
-        try:
-            import torch
-            from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer
-        except ImportError as exc:
-            raise RuntimeError("Install the 'models' extra to use M2M100") from exc
-        if self._device == "auto":
-            self._device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._tokenizer = M2M100Tokenizer.from_pretrained(
-            self.config.model, local_files_only=self.config.offline
+        self._load_engine()
+
+    def _cache_root(self) -> Path:
+        root = (
+            Path(self.config.model_dir)
+            if self.config.model_dir
+            else Path(".cache/onevoice/m2m100_ct2")
         )
-        self._model = M2M100ForConditionalGeneration.from_pretrained(
-            self.config.model, local_files_only=self.config.offline
-        ).to(self._device)
-        self._model.eval()
-        self._torch = torch
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _download_snapshot(self) -> Path:
+        model_id = self.config.model
+        source_dir = (
+            self._cache_root().parent
+            / "m2m100_sources"
+            / model_id.replace("/", "--")
+        )
+        source_dir.mkdir(parents=True, exist_ok=True)
+        common_files = [
+            "config.json",
+            "generation_config.json",
+            "sentencepiece.bpe.model",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "vocab.json",
+        ]
+        if self.config.offline:
+            has_weights = any(source_dir.glob("*.safetensors")) or (
+                source_dir / "pytorch_model.bin"
+            ).is_file() or any(source_dir.glob("*.bin.index.json"))
+            has_tokenizer = (source_dir / "sentencepiece.bpe.model").is_file()
+            if has_weights and has_tokenizer and (source_dir / "config.json").is_file():
+                return source_dir
+            raise RuntimeError(f"M2M100 offline cache is incomplete: {source_dir}")
+        try:
+            snapshot = self._snapshot_download(
+                repo_id=model_id,
+                local_dir=source_dir,
+                allow_patterns=common_files
+                + ["*.safetensors", "*.safetensors.index.json"],
+                local_files_only=False,
+                max_workers=4,
+            )
+            snapshot_path = Path(snapshot)
+            has_weights = any(snapshot_path.glob("*.safetensors"))
+            if not has_weights:
+                snapshot = self._snapshot_download(
+                    repo_id=model_id,
+                    local_dir=source_dir,
+                    allow_patterns=common_files
+                    + ["pytorch_model.bin", "*.bin.index.json"],
+                    local_files_only=False,
+                    max_workers=4,
+                )
+                snapshot_path = Path(snapshot)
+                has_weights = (snapshot_path / "pytorch_model.bin").is_file() or any(
+                    snapshot_path.glob("*.bin.index.json")
+                )
+            if not has_weights:
+                raise RuntimeError("model snapshot has no supported weights")
+            return snapshot_path
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not resolve {model_id} from Hugging Face Hub: {exc}"
+            ) from exc
+
+    def _conversion_quantization(self) -> str | None:
+        value = self.config.compute_type.lower()
+        return None if value in ("auto", "default") else value
+
+    def _load_engine(self) -> _M2M100Engine:
+        if self._engine is not None:
+            return self._engine
+        self._import_dependencies()
+        snapshot = self._download_snapshot()
+        suffix = self._conversion_quantization() or "default"
+        output_dir = self._cache_root() / (
+            f"{self.config.model.replace('/', '--')}--{suffix}"
+        )
+        if not self._ct2.contains_model(str(output_dir)):
+            converter = self._converter_type(str(snapshot))
+            converter.convert(
+                str(output_dir),
+                quantization=self._conversion_quantization(),
+                force=output_dir.exists(),
+            )
+        tokenizer = self._auto_tokenizer.from_pretrained(
+            snapshot, local_files_only=True
+        )
+        translator = self._ct2.Translator(
+            str(output_dir),
+            device=self.config.device,
+            compute_type=self.config.compute_type,
+            inter_threads=1,
+        )
+        self._engine = _M2M100Engine(tokenizer=tokenizer, translator=translator)
+        return self._engine
+
+    def _translate_once(self, text: str, source: str, target: str) -> str:
+        engine = self._load_engine()
+        engine.tokenizer.src_lang = source
+        source_ids = engine.tokenizer.encode(text)
+        source_tokens = engine.tokenizer.convert_ids_to_tokens(source_ids)
+        try:
+            target_token = engine.tokenizer.lang_code_to_token[target]
+        except (AttributeError, KeyError) as exc:
+            raise ValueError(f"M2M100 tokenizer does not support target language: {target}") from exc
+        results = engine.translator.translate_batch(
+            [source_tokens],
+            target_prefix=[[target_token]],
+            beam_size=1,
+            max_decoding_length=self.config.max_new_tokens + 1,
+            return_scores=False,
+        )
+        # CTranslate2 includes the forced language token in the hypothesis.
+        target_tokens = results[0].hypotheses[0][1:]
+        target_ids = engine.tokenizer.convert_tokens_to_ids(target_tokens)
+        return engine.tokenizer.decode(target_ids, skip_special_tokens=True).strip()
 
     def reset(self) -> None:
         pass
 
     def close(self) -> None:
-        self._model = None
-        self._tokenizer = None
-        self._torch = None
+        if self._engine is not None:
+            unload = getattr(self._engine.translator, "unload_model", None)
+            if callable(unload):
+                unload()
+        self._engine = None
 
     def translate(self, request: TranslationRequest) -> TranslationUpdate:
-        if self._model is None or self._tokenizer is None or self._torch is None:
-            self.load()
         started = monotonic()
         translated_sentences: list[str] = []
         source_sentences = (
@@ -312,17 +444,11 @@ class M2M100Backend:
             else (request.text,)
         ) or (request.text,)
         for source_sentence in source_sentences:
-            self._tokenizer.src_lang = request.source_language
-            encoded = self._tokenizer(source_sentence, return_tensors="pt", truncation=True)
-            encoded = {key: value.to(self._device) for key, value in encoded.items()}
-            with self._torch.inference_mode():
-                generated = self._model.generate(
-                    **encoded,
-                    forced_bos_token_id=self._tokenizer.get_lang_id(request.target_language),
-                    max_new_tokens=self.config.max_new_tokens,
-                    num_beams=1,
-                )
-            text = self._tokenizer.batch_decode(generated, skip_special_tokens=True)[0].strip()
+            text = self._translate_once(
+                source_sentence,
+                request.source_language,
+                request.target_language,
+            )
             translated_sentences.append(
                 restore_terminal_punctuation(
                     source_sentence,

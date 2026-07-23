@@ -9,7 +9,7 @@ WebRTC microphone / audio file
   -> Moonshine native streaming ASR (Dolphin/Faster-Whisper optional)
   -> Local Agreement: locked completed sentences + mutable current fragment
   -> Wait-k policy
-  -> OPUS-MT + CTranslate2 INT8 translation (M2M100 optional)
+  -> OPUS-MT or M2M100 + CTranslate2 INT8 translation
   -> Sentence-aware Local Agreement phrase chunker (8–24 token)
   -> sherpa-onnx VITS/Piper TTS (optional)
   -> CLI / Streamlit audio events
@@ -43,7 +43,7 @@ Chạy Streamlit:
 streamlit run app/streamlit_app.py
 ```
 
-Lần khởi tạo đầu tiên sẽ tải model Moonshine và một hoặc hai model OPUS-MT đúng với hướng dịch đã chọn. OPUS-MT được convert INT8 một lần vào `.cache/onevoice/opus_ct2`; các lần sau dùng lại trực tiếp. Không bật **Chỉ dùng model cache (offline)** trước khi asset đã được cache và convert.
+Lần khởi tạo đầu tiên sẽ tải model Moonshine và model dịch đã chọn. OPUS-MT được convert một lần vào `.cache/onevoice/opus_ct2`; M2M100 được convert vào `.cache/onevoice/m2m100_ct2`. Các lần sau CTranslate2 dùng lại cache trực tiếp. Không bật **Chỉ dùng model cache (offline)** trước khi asset đã được tải và convert.
 
 Cấu hình mặc định dùng Moonshine CPU/ONNX Runtime vì model cache state khi audio được thêm dần, không decode lại toàn bộ câu. Nếu chọn CUDA, runtime phải có CUDA Execution Provider; nếu không adapter sẽ báo lỗi rõ. Faster-Whisper vẫn được giữ làm backend fallback.
 
@@ -137,7 +137,7 @@ Theo dõi ASR/MT/TTS inference latency, thời gian đến output đầu tiên, 
 - [Dolphin](https://github.com/DataoceanAI/Dolphin): Apache-2.0 cho code và weights; adapter hiện hỗ trợ `base`/`small` cho Việt, Trung, Hàn. Repo chính thức không liệt kê English.
 - [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper): MIT, CTranslate2 implementation của Whisper.
 - [OPUS-MT](https://github.com/Helsinki-NLP/Opus-MT) chạy bằng [CTranslate2](https://opennmt.net/CTranslate2/): backend mặc định. Các model Việt↔Anh và phần lớn model theo cặp dùng Apache-2.0; `zh-en` và model English→Korean dùng CC-BY-4.0. Kiểm tra model card tương ứng trước khi phân phối sản phẩm.
-- [M2M100-418M](https://huggingface.co/facebook/m2m100_418M): MIT, hỗ trợ trực tiếp cả 12 hướng giữa bốn ngôn ngữ.
+- [M2M100-418M](https://huggingface.co/facebook/m2m100_418M): MIT, hỗ trợ trực tiếp cả 12 hướng giữa bốn ngôn ngữ; backend convert Hugging Face weights một lần rồi inference bằng CTranslate2 với target-language prefix.
 - `streamlit-webrtc`: MIT.
 
 MT dùng hybrid wait-k: sentence boundary là trigger ưu tiên, nhưng partial vẫn chạy sau mỗi cụm token ổn định hoặc timeout để subtitle không phải chờ hết câu. Pending partial cùng utterance được coalesce latest-only; final đi qua lane lossless. Partial MT dịch toàn prefix một lần, còn final được dịch theo từng câu và giữ dấu kết thúc để giảm bỏ sót. TTS global default là `final_utterance`; riêng Streamlit/realtime profile dùng `stable_sentence`, chỉ phát target sentence hoàn chỉnh đã đồng thuận hoặc tail từ final. Hard maximum vẫn là 24 token và UI ghép internal chunk theo câu trước khi autoplay. VAD semantic endpoint và TTS emission là hai policy độc lập. Backend `sherpa_onnx` tự chọn voice theo target language, tải lần đầu vào `.cache/onevoice/tts` và tái sử dụng cache; UI không yêu cầu đường dẫn model. `offline: true` sẽ fail sớm nếu voice chưa được cache.

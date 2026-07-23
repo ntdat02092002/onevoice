@@ -200,6 +200,8 @@ Backend mặc định `OpusMtCTranslate2Backend` là ví dụ cho một adapter 
 - cache source dùng file thật trong project để không yêu cầu quyền tạo symlink trên Windows;
 - `beam_size=1` giảm latency và mỗi request vẫn dịch toàn stable prefix do Wait-k policy quản lý ở ngoài adapter.
 
+`M2M100Backend` dùng cùng pattern download/convert/cache nhưng chỉ có một multilingual model. Sau conversion, inference phải dùng `ctranslate2.Translator`, đặt `tokenizer.src_lang`, truyền `target_prefix=[[tokenizer.lang_code_to_token[target]]]`, rồi bỏ forced language token đầu hypothesis trước khi decode. Không dùng `M2M100ForConditionalGeneration.generate()` trong runtime nữa.
+
 Danh sách route/model nằm trong `OPUS_PAIR_MODELS` tại `src/onevoice/backends/translation.py`. Khi thêm model direct mới, chỉ cần thêm cặp vào mapping; không sửa `RealtimePipeline`.
 
 ```python

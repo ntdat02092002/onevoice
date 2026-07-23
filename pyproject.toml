@@ -31,6 +31,7 @@ opus = [
   "transformers>=4.46,<5",
 ]
 models = [
+  "ctranslate2>=4.8,<5",
   "faster-whisper>=1.1,<2",
   "sentencepiece>=0.2,<1",
   "torch>=2.2,<3",
