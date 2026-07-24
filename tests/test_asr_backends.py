@@ -7,6 +7,7 @@ import pytest
 
 from onevoice.backends.asr import (
     DolphinAsrBackend,
+    FasterWhisperBackend,
     MoonshineAsrBackend,
     asr_model_options,
 )
@@ -44,16 +45,35 @@ class _FakeMoonshineTranscriber:
     def update_transcription(self):
         self.updates += 1
         if self.updates == 1:
-            lines = [SimpleNamespace(text="hello")]
+            lines = [
+                SimpleNamespace(
+                    text="hello",
+                    start_time=0.0,
+                    words=[
+                        SimpleNamespace(
+                            word="hello",
+                            start=0.1,
+                            end=0.4,
+                            confidence=0.9,
+                        )
+                    ],
+                )
+            ]
         else:
             # Moonshine exposes newest lines first.
-            lines = [SimpleNamespace(text="draft"), SimpleNamespace(text="hello")]
+            lines = [
+                SimpleNamespace(text="draft", start_time=0.5, words=[]),
+                SimpleNamespace(text="hello", start_time=0.0, words=[]),
+            ]
         return SimpleNamespace(lines=lines)
 
     def stop(self):
         self.stops += 1
         return SimpleNamespace(
-            lines=[SimpleNamespace(text="world"), SimpleNamespace(text="hello")]
+            lines=[
+                SimpleNamespace(text="world", start_time=0.5, words=[]),
+                SimpleNamespace(text="hello", start_time=0.0, words=[]),
+            ]
         )
 
     def close(self) -> None:
@@ -75,8 +95,11 @@ def test_moonshine_only_pushes_unseen_audio_tail() -> None:
     assert native.starts == 1
     assert native.stops == 1
     assert first.text == "hello"
+    assert first.words[0].text == "hello"
+    assert first.words[0].end_seconds == 0.4
     assert final.text == "hello world"
     assert final.is_final
+    assert native.kwargs["options"]["word_timestamps"] == "true"
 
 
 class _FakeTensor:
@@ -107,6 +130,33 @@ def test_dolphin_maps_result_and_rejects_english() -> None:
 
     with pytest.raises(ValueError, match="does not support English"):
         backend.transcribe(_segment(4_000), "en")
+
+
+def test_faster_whisper_exposes_word_timestamps() -> None:
+    backend = FasterWhisperBackend(
+        AsrConfig(backend="faster_whisper", model="tiny", language="en")
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeWhisper:
+        def transcribe(self, _samples, **kwargs):
+            captured.update(kwargs)
+            words = [
+                SimpleNamespace(word="Hello", start=0.1, end=0.4, probability=0.8),
+                SimpleNamespace(word="world", start=0.5, end=0.9, probability=0.9),
+            ]
+            return (
+                iter([SimpleNamespace(text="Hello world.", words=words)]),
+                SimpleNamespace(language="en", language_probability=0.99),
+            )
+
+    backend._model = _FakeWhisper()
+    update = backend.transcribe(_segment(16_000), "en")
+
+    assert captured["word_timestamps"] is True
+    assert update.text == "Hello world."
+    assert [word.text for word in update.words] == ["Hello", "world"]
+    assert update.words[-1].end_seconds == 0.9
 
 
 def test_asr_capabilities_fail_before_model_loading() -> None:

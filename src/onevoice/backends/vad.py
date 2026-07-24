@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 import threading
 from time import monotonic
 
@@ -15,6 +16,12 @@ def _float_to_pcm16(samples: np.ndarray) -> bytes:
     return (clipped * 32767.0).astype("<i2", copy=False).tobytes()
 
 
+@dataclass(frozen=True, slots=True)
+class _EndpointRequest:
+    started_at: float | None
+    cut_sample: int | None
+
+
 class WebRtcVadBackend:
     """WebRTC VAD plus utterance assembly and periodic partial snapshots."""
 
@@ -23,6 +30,8 @@ class WebRtcVadBackend:
         self.audio_config = audio_config
         self._vad = None
         self._endpoint_requested = threading.Event()
+        self._endpoint_lock = threading.Lock()
+        self._endpoint_request: _EndpointRequest | None = None
         self._pending = np.empty(0, dtype=np.float32)
         self._silence_history: deque[np.ndarray] = deque()
         self._candidate: list[np.ndarray] = []
@@ -47,7 +56,9 @@ class WebRtcVadBackend:
         self.reset()
 
     def reset(self) -> None:
-        self._endpoint_requested.clear()
+        with self._endpoint_lock:
+            self._endpoint_request = None
+            self._endpoint_requested.clear()
         self._pending = np.empty(0, dtype=np.float32)
         self._silence_history = deque(maxlen=self._padding_frames)
         self._candidate.clear()
@@ -61,9 +72,27 @@ class WebRtcVadBackend:
         self.reset()
         self._vad = None
 
-    def request_endpoint(self) -> None:
-        """Ask the audio-owning thread to finish the active utterance safely."""
-        self._endpoint_requested.set()
+    def request_endpoint(
+        self,
+        *,
+        started_at: float | None = None,
+        cut_sample: int | None = None,
+    ) -> None:
+        """Ask the audio thread to cut an utterance at a recognized snapshot."""
+        if cut_sample is not None and cut_sample <= 0:
+            raise ValueError("cut_sample must be positive")
+        with self._endpoint_lock:
+            self._endpoint_request = _EndpointRequest(started_at, cut_sample)
+            self._endpoint_requested.set()
+
+    def _take_endpoint_request(self) -> _EndpointRequest | None:
+        if not self._endpoint_requested.is_set():
+            return None
+        with self._endpoint_lock:
+            request = self._endpoint_request
+            self._endpoint_request = None
+            self._endpoint_requested.clear()
+            return request
 
     def process(self, chunk: AudioChunk) -> list[SpeechSegment]:
         if self._vad is None:
@@ -105,9 +134,12 @@ class WebRtcVadBackend:
         self._frames_since_emit += 1
         self._silence_frames = 0 if voiced else self._silence_frames + 1
 
-        if self._endpoint_requested.is_set():
-            self._endpoint_requested.clear()
-            return [self._finish(captured_at)]
+        endpoint = self._take_endpoint_request()
+        if endpoint is not None:
+            if endpoint.started_at is None or endpoint.started_at == self._started_at:
+                if endpoint.cut_sample is None:
+                    return [self._finish(captured_at)]
+                return [self._finish_at(endpoint.cut_sample)]
         if len(self._utterance) >= self._max_frames:
             return [self._finish(captured_at)]
         if self._silence_frames >= self._end_silence_frames:
@@ -129,6 +161,37 @@ class WebRtcVadBackend:
         self.reset()
         return segment
 
+    def _finish_at(self, cut_sample: int) -> SpeechSegment:
+        samples = (
+            np.concatenate(self._utterance)
+            if self._utterance
+            else np.empty(0, dtype=np.float32)
+        )
+        cut_sample = min(max(1, cut_sample), len(samples))
+        prefix = samples[:cut_sample].copy()
+        suffix = samples[cut_sample:].copy()
+        old_started_at = self._started_at
+        cut_ended_at = old_started_at + cut_sample / self.audio_config.sample_rate
+        segment = SpeechSegment(
+            prefix,
+            self.audio_config.sample_rate,
+            old_started_at,
+            cut_ended_at,
+            True,
+            True,
+        )
+
+        self.reset()
+        if suffix.size:
+            self._active = True
+            self._started_at = cut_ended_at
+            self._utterance = [
+                suffix[index : index + self._frame_samples].copy()
+                for index in range(0, len(suffix), self._frame_samples)
+            ]
+            self._frames_since_emit = len(self._utterance)
+        return segment
+
     def flush(self) -> list[SpeechSegment]:
         if self._active and self._utterance:
             return [self._finish(monotonic())]
@@ -142,6 +205,8 @@ class PassthroughVad:
     def __init__(self, config: VadConfig, audio_config: AudioConfig) -> None:
         self.audio_config = audio_config
         self._endpoint_requested = threading.Event()
+        self._endpoint_lock = threading.Lock()
+        self._endpoint_request: _EndpointRequest | None = None
         self._samples: list[np.ndarray] = []
         self._started_at = monotonic()
 
@@ -149,23 +214,65 @@ class PassthroughVad:
         pass
 
     def reset(self) -> None:
-        self._endpoint_requested.clear()
+        with self._endpoint_lock:
+            self._endpoint_request = None
+            self._endpoint_requested.clear()
         self._samples.clear()
         self._started_at = monotonic()
 
     def close(self) -> None:
         self.reset()
 
-    def request_endpoint(self) -> None:
-        self._endpoint_requested.set()
+    def request_endpoint(
+        self,
+        *,
+        started_at: float | None = None,
+        cut_sample: int | None = None,
+    ) -> None:
+        if cut_sample is not None and cut_sample <= 0:
+            raise ValueError("cut_sample must be positive")
+        with self._endpoint_lock:
+            self._endpoint_request = _EndpointRequest(started_at, cut_sample)
+            self._endpoint_requested.set()
+
+    def _take_endpoint_request(self) -> _EndpointRequest | None:
+        if not self._endpoint_requested.is_set():
+            return None
+        with self._endpoint_lock:
+            request = self._endpoint_request
+            self._endpoint_request = None
+            self._endpoint_requested.clear()
+            return request
 
     def process(self, chunk: AudioChunk) -> list[SpeechSegment]:
         if chunk.samples.size:
             self._samples.append(chunk.samples)
         samples = np.concatenate(self._samples) if self._samples else np.empty(0, dtype=np.float32)
-        if self._endpoint_requested.is_set() and samples.size:
-            self._endpoint_requested.clear()
-            return self.flush()
+        endpoint = self._take_endpoint_request()
+        if endpoint is not None and samples.size:
+            if endpoint.started_at is None or endpoint.started_at == self._started_at:
+                if endpoint.cut_sample is None:
+                    return self.flush()
+                cut_sample = min(max(1, endpoint.cut_sample), len(samples))
+                prefix = samples[:cut_sample].copy()
+                suffix = samples[cut_sample:].copy()
+                old_started_at = self._started_at
+                cut_ended_at = (
+                    old_started_at + cut_sample / self.audio_config.sample_rate
+                )
+                result = SpeechSegment(
+                    prefix,
+                    self.audio_config.sample_rate,
+                    old_started_at,
+                    cut_ended_at,
+                    True,
+                    True,
+                )
+                self.reset()
+                if suffix.size:
+                    self._samples = [suffix]
+                    self._started_at = cut_ended_at
+                return [result]
         if chunk.end_of_stream:
             return self.flush()
         return [SpeechSegment(samples, chunk.sample_rate, self._started_at, monotonic(), False)] if samples.size else []

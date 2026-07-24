@@ -47,7 +47,15 @@ class LocalAgreementCommitter:
         current = self._extract_current(tokens)
 
         if update.is_final:
-            final_tokens = self._final_tokens(tokens, current)
+            # A timestamped semantic endpoint deliberately removes the mutable
+            # current-sentence tail from the waveform. Keep only completed
+            # sentences already locked by agreement so that tail cannot leak
+            # into this final and repeat in the carried suffix utterance.
+            final_tokens = (
+                (self._locked or tokens)
+                if update.is_endpoint_cut
+                else self._final_tokens(tokens, current)
+            )
             return self._emit(final_tokens, language, is_final=True)
 
         self._last_hypothesis = tokens

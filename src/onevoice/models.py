@@ -53,6 +53,15 @@ class SpeechSegment:
     started_at: float
     ended_at: float
     is_final: bool = False
+    is_endpoint_cut: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class AsrWordTiming:
+    text: str
+    start_seconds: float
+    end_seconds: float
+    confidence: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +74,8 @@ class AsrUpdate:
     started_at: float
     completed_at: float = field(default_factory=monotonic)
     tokens: tuple[str, ...] = ()
+    words: tuple[AsrWordTiming, ...] = ()
+    is_endpoint_cut: bool = False
 
     @property
     def latency_ms(self) -> float:

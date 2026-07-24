@@ -39,6 +39,7 @@ Ngôn ngữ sản phẩm:
 | `medium_streaming` | 245M | `en` | Chất lượng cao nhất trong catalog hiện tại |
 
 - Adapter chỉ thêm phần waveform mới vào native `Transcriber`; không gửi lại phần audio đã xử lý.
+- Adapter bật word timestamps và trả chúng trong `AsrUpdate.words`; semantic endpoint dùng timestamp từ cuối câu stable để cắt audio chính xác dù câu kế tiếp đã bắt đầu.
 - `device=cpu` dùng ONNX Runtime CPU. `device=cuda` yêu cầu CUDA Execution Provider khả dụng.
 - Model English dùng MIT. Model `vi/zh/ko` dùng Moonshine Community License, chỉ phi thương mại.
 - Không dùng `language=auto`; phải chọn rõ language trước khi load model.
@@ -56,6 +57,7 @@ Ngôn ngữ sản phẩm:
 - UI cung cấp `tiny`, `base`, `small`; backend truyền `config.asr.model` trực tiếp cho `WhisperModel`, nên YAML/CLI có thể dùng model ID Faster-Whisper hợp lệ khác.
 - `language=auto` truyền `language=None` để Whisper detect language và trả `language_probability`.
 - CPU thường dùng `compute_type=int8`; CUDA thường dùng `float16`.
+- Adapter bật `word_timestamps=True` để cung cấp sentence-end cursor cho semantic endpoint.
 - Đây là fallback đa ngôn ngữ. Adapter hiện decode lại toàn growing utterance nên thường kém hiệu quả hơn Moonshine native streaming cho mic realtime.
 - License implementation Faster-Whisper: MIT; license weights phụ thuộc model được chọn.
 
@@ -158,7 +160,7 @@ vad:
   semantic_endpoint_sentences: 2
 ```
 
-Semantic endpoint đóng utterance khi stable/committed có đủ số câu hoàn chỉnh và cả stable text lẫn ASR hypothesis mới nhất đều kết thúc tại sentence boundary. Vì vậy fragment câu tiếp theo chưa hoàn chỉnh không bị cắt. Terminal mark đã vượt Local Agreement được publish dù `hold_tokens=1`, tạo cửa sổ endpoint thực sự. Đặt `semantic_endpoint_enabled: false` để chỉ dùng silence/max-duration endpoint.
+Semantic endpoint đóng utterance khi stable/committed có đủ số câu hoàn chỉnh. Nếu ASR có word timestamps, pipeline đối chiếu lexical prefix của câu stable với các timed word, lấy `end_seconds` của từ cuối và đổi thành `cut_sample`; trailing fragment của câu tiếp theo không chặn endpoint và được giữ nguyên trong suffix. Nếu timestamp thiếu hoặc không khớp hypothesis, pipeline fallback an toàn: chỉ endpoint khi cả stable text lẫn ASR hypothesis mới nhất đều kết thúc tại sentence boundary. VAD chỉ áp dụng request có đúng utterance `started_at`, trả prefix thành final và chuyển suffix đã buffer sang utterance kế tiếp. Đặt `semantic_endpoint_enabled: false` để chỉ dùng silence/max-duration endpoint.
 
 ## Audio preprocessing, commit và translation policy
 
