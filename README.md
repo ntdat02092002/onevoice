@@ -99,11 +99,11 @@ Các contract chính:
 - `TranslationBackend.translate(TranslationRequest) -> TranslationUpdate`
 - `TtsBackend.synthesize(TtsRequest) -> TtsUpdate`
 - `VadBackend.process(AudioChunk) -> list[SpeechSegment]`
-- `VadBackend.request_endpoint() -> None` (tín hiệu thread-safe; audio worker mới thực sự đóng utterance)
+- `VadBackend.request_endpoint(started_at=..., cut_sample=...) -> None` (tín hiệu thread-safe; audio worker cắt đúng snapshot ASR đã xác nhận)
 
-Queue audio/ASR/MT/TTS đều có giới hạn. Khi audio overload, pipeline phát event, bỏ utterance bị đứt và reset generation để kết quả cũ không lọt xuống downstream. Partial MT được coalesce latest-only; ASR final, MT final và TTS sinh từ final đi qua lane lossless.
+Queue audio/ASR/MT/TTS đều có giới hạn. Khi audio overload, pipeline phát event, bỏ utterance bị đứt và reset generation để kết quả cũ không lọt xuống downstream. Partial ASR và MT được coalesce latest-only theo utterance; ASR final, MT final và TTS sinh từ final đi qua lane lossless.
 
-Mặc định pipeline tự đóng utterance khi stable/committed có đủ 2 câu hoàn chỉnh và không còn fragment câu tiếp theo. Chỉnh `vad.semantic_endpoint_sentences`, hoặc đặt `vad.semantic_endpoint_enabled: false` để chỉ dùng khoảng lặng VAD và `max_utterance_seconds`. Sentence boundary dùng chung splitter với MT/TTS; điểm cắt audio xảy ra ngay sau khi ASR xác nhận ngưỡng nên có thể dư một đoạn ngắn do độ trễ inference.
+Mặc định pipeline tự đóng utterance khi stable/committed có đủ 2 câu hoàn chỉnh. Moonshine và Faster-Whisper trả word timestamps để pipeline ánh xạ từ cuối của câu stable sang sample cursor: câu sau có thể đã bắt đầu nhưng không bị nhập vào final, vì VAD cắt ngược tại boundary rồi giữ suffix làm đầu utterance kế tiếp. Backend không có timestamp vẫn dùng guard cũ và chỉ endpoint khi stable text cùng hypothesis mới nhất đều kết thúc tại boundary. Chỉnh `vad.semantic_endpoint_sentences`, hoặc đặt `vad.semantic_endpoint_enabled: false` để chỉ dùng khoảng lặng VAD và `max_utterance_seconds`.
 
 TTS phrase chỉ được commit sau khi synthesis thành công và consumer chấp nhận audio vào playback queue. Validity dựa trên generation và exact translated-prefix reservation: revision mới vẫn giữ phrase nếu content prefix không đổi, nhưng cancel reservation chưa synthesize khi content phân kỳ. Request bị queue drop, model lỗi hoặc event không giao được không bị coi nhầm là đã phát. Completed stream có idempotency guard để duplicate final không phát lại audio.
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import isfinite
 from pathlib import Path
 from time import monotonic
 from typing import Any, Iterable
@@ -7,7 +8,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from onevoice.config import AsrConfig
-from onevoice.models import AsrUpdate, SpeechSegment
+from onevoice.models import AsrUpdate, AsrWordTiming, SpeechSegment
 from onevoice.text import tokenize_text
 
 
@@ -84,6 +85,38 @@ def _transcript_text(transcript: Any) -> str:
     return " ".join(text for text in texts if text).strip()
 
 
+def _transcript_word_timings(transcript: Any) -> tuple[AsrWordTiming, ...]:
+    """Flatten Moonshine line words into utterance-relative timing order."""
+    lines = list(getattr(transcript, "lines", ()) or ())
+    lines.sort(key=lambda line: float(getattr(line, "start_time", 0.0)))
+    output: list[AsrWordTiming] = []
+    for line in lines:
+        words = list(getattr(line, "words", ()) or ())
+        words.sort(key=lambda word: float(getattr(word, "start", 0.0)))
+        for word in words:
+            text = str(getattr(word, "word", "")).strip()
+            start = float(getattr(word, "start", -1.0))
+            end = float(getattr(word, "end", -1.0))
+            if (
+                not text
+                or not isfinite(start)
+                or not isfinite(end)
+                or start < 0
+                or end <= start
+            ):
+                continue
+            confidence = getattr(word, "confidence", None)
+            output.append(
+                AsrWordTiming(
+                    text=text,
+                    start_seconds=start,
+                    end_seconds=end,
+                    confidence=float(confidence) if confidence is not None else None,
+                )
+            )
+    return tuple(output)
+
+
 class MoonshineAsrBackend:
     """Native incremental ASR using Moonshine's cached streaming state.
 
@@ -155,6 +188,9 @@ class MoonshineAsrBackend:
         options = {
             "identify_speakers": "false",
             "return_audio_data": "false",
+            # Semantic endpointing aligns a stable sentence boundary to the
+            # exact word end instead of waiting for a whole-snapshot boundary.
+            "word_timestamps": "true",
             # Segmentation is already owned by the pipeline's WebRTC VAD.
             "vad_threshold": "0",
         }
@@ -238,6 +274,8 @@ class MoonshineAsrBackend:
             is_final=segment.is_final,
             started_at=started,
             tokens=tokenize_text(text, selected),
+            words=_transcript_word_timings(transcript),
+            is_endpoint_cut=segment.is_endpoint_cut,
         )
 
 
@@ -319,6 +357,7 @@ class DolphinAsrBackend:
             is_final=segment.is_final,
             started_at=started,
             tokens=tokenize_text(text, detected),
+            is_endpoint_cut=segment.is_endpoint_cut,
         )
 
 
@@ -359,9 +398,27 @@ class FasterWhisperBackend:
             beam_size=self.config.beam_size,
             condition_on_previous_text=False,
             vad_filter=False,
-            word_timestamps=False,
+            word_timestamps=True,
         )
+        segments = list(segments)
         text = " ".join(item.text.strip() for item in segments if item.text.strip()).strip()
+        words = tuple(
+            AsrWordTiming(
+                text=str(word.word).strip(),
+                start_seconds=float(word.start),
+                end_seconds=float(word.end),
+                confidence=(
+                    float(word.probability)
+                    if getattr(word, "probability", None) is not None
+                    else None
+                ),
+            )
+            for item in segments
+            for word in (getattr(item, "words", None) or ())
+            if str(getattr(word, "word", "")).strip()
+            and float(getattr(word, "end", 0.0))
+            > float(getattr(word, "start", 0.0))
+        )
         detected = selected or getattr(info, "language", None)
         confidence = getattr(info, "language_probability", None)
         self._revision += 1
@@ -373,6 +430,8 @@ class FasterWhisperBackend:
             is_final=segment.is_final,
             started_at=started,
             tokens=tokenize_text(text, detected),
+            words=words,
+            is_endpoint_cut=segment.is_endpoint_cut,
         )
 
 
@@ -409,4 +468,5 @@ class FakeAsrBackend:
             is_final=segment.is_final,
             started_at=started,
             tokens=tokenize_text(text, selected),
+            is_endpoint_cut=segment.is_endpoint_cut,
         )

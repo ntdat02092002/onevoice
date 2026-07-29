@@ -194,6 +194,66 @@ def _translation_job(
     )
 
 
+def _asr_job(
+    sample_count: int, *, utterance_id: int = 1, final: bool = False
+) -> _AsrJob:
+    segment = SpeechSegment(
+        np.zeros(sample_count, dtype=np.float32),
+        16_000,
+        started_at=10.0,
+        ended_at=11.0,
+        is_final=final,
+    )
+    return _AsrJob(0, utterance_id, segment)
+
+
+def test_asr_pending_partial_is_latest_only_and_final_supersedes_it() -> None:
+    pipeline = RealtimePipeline(PipelineConfig())
+    first = _asr_job(320)
+    latest = _asr_job(1_280)
+
+    assert pipeline._enqueue_asr(first) == EnqueueResult.ENQUEUED
+    assert pipeline._enqueue_asr(latest) == EnqueueResult.REPLACED_PARTIAL
+    assert list(pipeline._asr_queue.queue) == [latest]
+
+    final = _asr_job(1_600, final=True)
+    assert pipeline._enqueue_asr(final) == EnqueueResult.ENQUEUED
+    assert list(pipeline._asr_queue.queue) == [final]
+    pipeline._drain_queue(pipeline._asr_queue)
+
+
+def test_asr_coalescing_removes_preexisting_stale_snapshots() -> None:
+    pipeline = RealtimePipeline(PipelineConfig())
+    stale = [_asr_job(size) for size in (320, 640, 960)]
+    for item in stale:
+        pipeline._asr_queue.put_nowait(item)
+
+    latest = _asr_job(1_280)
+    assert pipeline._enqueue_asr(latest) == EnqueueResult.REPLACED_PARTIAL
+    assert list(pipeline._asr_queue.queue) == [latest]
+    pipeline._drain_queue(pipeline._asr_queue)
+
+
+def test_asr_full_queue_replaces_a_partial_but_never_a_final() -> None:
+    pipeline = RealtimePipeline(PipelineConfig())
+    finals = [
+        _asr_job(320, utterance_id=index, final=True)
+        for index in range(1, pipeline._asr_queue.maxsize)
+    ]
+    disposable = _asr_job(320, utterance_id=10)
+    for item in [*finals, disposable]:
+        pipeline._asr_queue.put_nowait(item)
+
+    latest = _asr_job(640, utterance_id=11)
+    assert pipeline._enqueue_asr(latest) == EnqueueResult.REPLACED_PARTIAL
+    assert list(pipeline._asr_queue.queue) == [*finals, latest]
+
+    extra_final = _asr_job(640, utterance_id=12, final=True)
+    assert pipeline._enqueue_asr(extra_final) == EnqueueResult.ENQUEUED
+    assert list(pipeline._asr_queue.queue) == [*finals, latest, extra_final]
+    pipeline._drain_queue(pipeline._asr_queue)
+
+
 def test_mt_pending_partial_is_latest_only_and_final_supersedes_it() -> None:
     pipeline = RealtimePipeline(PipelineConfig())
     results = [

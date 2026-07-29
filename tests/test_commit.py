@@ -6,7 +6,13 @@ from onevoice.models import AsrUpdate
 from onevoice.text import tokenize_text
 
 
-def update(text: str, revision: int, final: bool = False, language: str = "en") -> AsrUpdate:
+def update(
+    text: str,
+    revision: int,
+    final: bool = False,
+    language: str = "en",
+    endpoint_cut: bool = False,
+) -> AsrUpdate:
     return AsrUpdate(
         text=text,
         language=language,
@@ -15,6 +21,7 @@ def update(text: str, revision: int, final: bool = False, language: str = "en") 
         is_final=final,
         started_at=monotonic(),
         tokens=tokenize_text(text, language),
+        is_endpoint_cut=endpoint_cut,
     )
 
 
@@ -90,3 +97,23 @@ def test_agreed_terminal_mark_is_not_hidden_by_hold_tokens() -> None:
 
     assert stable is not None
     assert stable.text == "Sentence one."
+
+
+def test_timestamped_endpoint_final_discards_mutable_tail() -> None:
+    committer = LocalAgreementCommitter(
+        CommitConfig(agreement_updates=2, hold_tokens=1)
+    )
+    draft = "One. unfinished tail"
+
+    assert committer.update(update(draft, 1)) is None
+    stable = committer.update(update(draft, 2))
+    assert stable is not None
+    assert stable.text.startswith("One.")
+    assert stable.text != "One."
+
+    final = committer.update(
+        update("One.", 3, final=True, endpoint_cut=True)
+    )
+
+    assert final.is_final
+    assert final.text == "One."

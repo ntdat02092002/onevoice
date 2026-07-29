@@ -30,7 +30,12 @@ class AudioPreprocessor(Lifecycle, Protocol):
 class VadBackend(Lifecycle, Protocol):
     def process(self, chunk: AudioChunk) -> list[SpeechSegment]: ...
     def flush(self) -> list[SpeechSegment]: ...
-    def request_endpoint(self) -> None: ...
+    def request_endpoint(
+        self,
+        *,
+        started_at: float | None = None,
+        cut_sample: int | None = None,
+    ) -> None: ...
 
 
 @runtime_checkable

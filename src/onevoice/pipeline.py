@@ -5,6 +5,7 @@ import threading
 from collections import Counter
 from dataclasses import dataclass
 from enum import StrEnum
+from math import isfinite
 from time import monotonic
 from typing import Any
 
@@ -14,6 +15,7 @@ from . import backends as _builtin_backends  # noqa: F401
 from .config import PipelineConfig
 from .models import (
     AsrUpdate,
+    AsrWordTiming,
     AudioChunk,
     CommittedTranscript,
     EventType,
@@ -32,7 +34,12 @@ from .protocols import (
     VadBackend,
 )
 from .registry import registry
-from .text import count_complete_sentences, ends_phrase, tokenize_text
+from .text import (
+    count_complete_sentences,
+    ends_phrase,
+    sentence_token_boundaries,
+    tokenize_text,
+)
 
 
 _STOP = object()
@@ -333,16 +340,17 @@ class RealtimePipeline:
                         self._utterance_sequence += 1
                         self._active_utterance_id = self._utterance_sequence
                         self._emit(EventType.SPEECH_START, message="speech")
-                    self._put_latest(
-                        self._asr_queue,
+                    asr_result = self._enqueue_asr(
                         _AsrJob(
                             self._current_generation(),
                             self._active_utterance_id,
                             segment,
-                        ),
-                        segment.is_final,
-                        stage="ASR",
+                        )
                     )
+                    if asr_result == EnqueueResult.REPLACED_PARTIAL:
+                        self._count_metric("asr_partials_coalesced")
+                    elif asr_result == EnqueueResult.DROPPED_PARTIAL:
+                        self._count_metric("asr_partials_dropped")
                     if segment.is_final:
                         self._speech_active = False
                         self._emit(EventType.SPEECH_END, message="transcribing")
@@ -393,7 +401,12 @@ class RealtimePipeline:
                         )
                     },
                 )
-                self._maybe_request_semantic_endpoint(committed, update.text)
+                self._maybe_request_semantic_endpoint(
+                    committed,
+                    update.text,
+                    item.segment,
+                    update.words,
+                )
                 request = self._translation_policy.request_for(
                     committed, self.config.translation.target_language
                 )
@@ -425,7 +438,11 @@ class RealtimePipeline:
                 self._asr_queue.task_done()
 
     def _maybe_request_semantic_endpoint(
-        self, committed: CommittedTranscript, active_hypothesis: str | None = None
+        self,
+        committed: CommittedTranscript,
+        active_hypothesis: str | None = None,
+        segment: SpeechSegment | None = None,
+        word_timings: tuple[AsrWordTiming, ...] = (),
     ) -> None:
         config = self.config.vad
         active_text = active_hypothesis or committed.text
@@ -435,7 +452,16 @@ class RealtimePipeline:
             or self._semantic_endpoint_pending.is_set()
             or count_complete_sentences(committed.text, committed.language)
             < config.semantic_endpoint_sentences
-            or not ends_phrase(committed.text, committed.language)
+        ):
+            return
+        cut_sample = self._aligned_sentence_cut_sample(
+            committed,
+            segment,
+            word_timings,
+            config.semantic_endpoint_sentences,
+        )
+        if cut_sample is None and (
+            not ends_phrase(committed.text, committed.language)
             or not ends_phrase(active_text, committed.language)
         ):
             return
@@ -448,10 +474,114 @@ class RealtimePipeline:
             return
         self._semantic_endpoint_pending.set()
         try:
-            request_endpoint()
+            if segment is None:
+                request_endpoint()
+            else:
+                request_endpoint(
+                    started_at=segment.started_at,
+                    cut_sample=cut_sample or len(segment.samples),
+                )
         except Exception:
             self._semantic_endpoint_pending.clear()
             raise
+
+    @staticmethod
+    def _aligned_sentence_cut_sample(
+        committed: CommittedTranscript,
+        segment: SpeechSegment | None,
+        word_timings: tuple[AsrWordTiming, ...],
+        sentence_count: int,
+    ) -> int | None:
+        """Map the configured stable sentence boundary to its final word end."""
+        if segment is None or not word_timings:
+            return None
+        boundaries = sentence_token_boundaries(committed.text, committed.language)
+        if len(boundaries) < sentence_count:
+            return None
+        # Cut after the latest completed stable sentence, not an earlier
+        # threshold sentence. The committer may already have locked all of
+        # them; cutting earlier would put locked text outside the final audio.
+        target_tokens = committed.tokens[: boundaries[-1]]
+        target = tuple(
+            token.casefold()
+            for token in target_tokens
+            if any(character.isalnum() for character in token)
+        )
+        if not target:
+            return None
+
+        timed_tokens: list[tuple[str, AsrWordTiming]] = []
+        for timing in word_timings:
+            for token in tokenize_text(timing.text, committed.language):
+                if any(character.isalnum() for character in token):
+                    timed_tokens.append((token.casefold(), timing))
+        if len(timed_tokens) < len(target):
+            return None
+        if tuple(token for token, _ in timed_tokens[: len(target)]) != target:
+            return None
+
+        end_seconds = timed_tokens[len(target) - 1][1].end_seconds
+        if not isfinite(end_seconds):
+            return None
+        cut_sample = round(end_seconds * segment.sample_rate)
+        if cut_sample <= 0:
+            return None
+        return min(cut_sample, len(segment.samples))
+
+    def _enqueue_asr(self, item: _AsrJob) -> EnqueueResult:
+        """Keep only the newest growing partial per utterance; finals are lossless."""
+        result = EnqueueResult.ENQUEUED
+        coalesced = 0
+        with self._asr_queue.mutex:
+            stream_id = (item.generation, item.utterance_id)
+            matching_partials = [
+                index
+                for index, queued in enumerate(self._asr_queue.queue)
+                if isinstance(queued, _AsrJob)
+                and not queued.segment.is_final
+                and (queued.generation, queued.utterance_id) == stream_id
+            ]
+
+            if not item.segment.is_final and matching_partials:
+                keep_index = matching_partials[-1]
+                self._asr_queue.queue[keep_index] = item
+                for index in reversed(matching_partials[:-1]):
+                    del self._asr_queue.queue[index]
+                    self._asr_queue.unfinished_tasks -= 1
+                    coalesced += 1
+                result = EnqueueResult.REPLACED_PARTIAL
+                self._asr_queue.not_empty.notify()
+            elif item.segment.is_final:
+                for index in reversed(matching_partials):
+                    del self._asr_queue.queue[index]
+                    self._asr_queue.unfinished_tasks -= 1
+                    coalesced += 1
+            elif self._asr_queue._qsize() >= self._asr_queue.maxsize:
+                replace_index = next(
+                    (
+                        index
+                        for index, queued in enumerate(self._asr_queue.queue)
+                        if isinstance(queued, _AsrJob) and not queued.segment.is_final
+                    ),
+                    None,
+                )
+                if replace_index is None:
+                    return EnqueueResult.DROPPED_PARTIAL
+                self._asr_queue.queue[replace_index] = item
+                self._asr_queue.not_empty.notify()
+                return EnqueueResult.REPLACED_PARTIAL
+
+            if result != EnqueueResult.REPLACED_PARTIAL:
+                # Final insertion may exceed maxsize when the queue contains
+                # only finals. This is the same logical lossless lane used by
+                # MT finals.
+                self._asr_queue._put(item)
+                self._asr_queue.unfinished_tasks += 1
+                self._asr_queue.not_empty.notify()
+
+        if coalesced:
+            self._count_metric("asr_partials_coalesced", coalesced)
+        return result
 
     def _translation_worker(self) -> None:
         while not self._stop_event.is_set():

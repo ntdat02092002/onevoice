@@ -66,6 +66,7 @@ WebRTC callback chỉ được resample/enqueue audio. Không chạy model, VAD 
 - `started_at` dùng `time.monotonic()` ngay trước inference.
 - `language` dùng mã `vi`, `en`, `zh`, `ko` hoặc kết quả language detection.
 - Nên tạo `tokens` bằng `onevoice.text.tokenize_text(text, language)`.
+- Nếu runtime có word timestamps, trả `words: tuple[AsrWordTiming, ...]` với thời gian tương đối từ đầu waveform của utterance. Pipeline dùng lexical alignment và `end_seconds` của từ cuối câu stable để tạo sample cursor; timestamp thiếu hoặc lệch text sẽ tự fallback về endpoint guard cũ.
 - Validate sớm language/model/device hoặc feature không hỗ trợ ngay trong constructor, trước import dependency, download weights hay cấp phát model.
 
 Backend ASR native-streaming có thể giữ encoder cache/RNN state bên trong, nhưng output ra contract vẫn phải là hypothesis đầy đủ. `reset()` phải xóa cache này khi sang generation/utterance không liên tục.
@@ -100,7 +101,7 @@ Ví dụ adapter tối giản cho một runtime giả định `MyAsrRuntime`:
 from time import monotonic
 
 from onevoice.config import AsrConfig
-from onevoice.models import AsrUpdate, SpeechSegment
+from onevoice.models import AsrUpdate, AsrWordTiming, SpeechSegment
 from onevoice.text import tokenize_text
 
 
@@ -404,7 +405,7 @@ VAD adapter chịu trách nhiệm gom frame thành utterance và phát snapshot:
 - partial `SpeechSegment(is_final=False)` chứa toàn bộ audio utterance hiện tại;
 - final `SpeechSegment(is_final=True)` khi endpoint, max duration hoặc `flush()`;
 - `flush()` phải trả final segment còn lại khi người dùng dừng mic/file;
-- `request_endpoint()` chỉ đặt một signal thread-safe; lần `process()` kế tiếp trên audio worker mới đóng utterance và trả final segment;
+- `request_endpoint(started_at=..., cut_sample=...)` chỉ đặt một signal thread-safe; lần `process()` kế tiếp trên audio worker mới cắt đúng snapshot, trả prefix thành final và giữ suffix làm đầu utterance kế tiếp;
 - sau final phải sẵn sàng nhận utterance tiếp theo;
 - giữ speech padding để không cắt mất âm đầu/cuối.
 
@@ -415,13 +416,18 @@ class MyVadBackend:
     def __init__(self, config: VadConfig, audio_config: AudioConfig) -> None:
         ...
 
-    def request_endpoint(self) -> None:
+    def request_endpoint(
+        self,
+        *,
+        started_at: float | None = None,
+        cut_sample: int | None = None,
+    ) -> None:
         # Không sửa buffer trực tiếp từ ASR worker. Dùng threading.Event
         # và consume event bên trong process().
         self._endpoint_requested.set()
 ```
 
-Không gọi ASR trực tiếp từ VAD. Pipeline sẽ đưa `SpeechSegment` sang ASR queue và tự xử lý backpressure. `request_endpoint()` được dùng bởi semantic endpoint cấu hình qua `vad.semantic_endpoint_enabled` và `vad.semantic_endpoint_sentences`.
+Không gọi ASR trực tiếp từ VAD. Pipeline sẽ đưa `SpeechSegment` sang ASR queue và tự xử lý backpressure; pending partial cùng utterance phải được coalesce latest-only, còn final phải lossless. `request_endpoint()` được dùng bởi semantic endpoint cấu hình qua `vad.semantic_endpoint_enabled` và `vad.semantic_endpoint_sentences`. Backend phải bỏ qua request có `started_at` cũ để không cắt nhầm utterance mới, và không được làm mất suffix đã tới sau `cut_sample`.
 
 ## 7. Thêm Local Agreement / commit policy
 
