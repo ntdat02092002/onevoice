@@ -1,0 +1,179 @@
+corpus_id: terminology-p0-v1
+schema_version: 1
+description: Text-first terminology corpus. Audio references are added incrementally.
+
+cases:
+  - id: exact-en-vi
+    category: exact
+    domain: factory-safety
+    source_language: en
+    target_language: vi
+    source: Press the emergency stop button now.
+    expected_terms:
+      - term_id: emergency_stop_button
+        target: nút dừng khẩn cấp
+    audio_ref: null
+
+  - id: exact-vi-en
+    category: exact
+    domain: factory-safety
+    source_language: vi
+    target_language: en
+    source: Hãy nhấn nút dừng khẩn cấp.
+    expected_terms:
+      - term_id: emergency_stop_button
+        target: emergency stop button
+    audio_ref: null
+
+  - id: exact-zh-en
+    category: exact
+    domain: factory-safety
+    source_language: zh
+    target_language: en
+    source: 请按下紧急停止按钮。
+    expected_terms:
+      - term_id: emergency_stop_button
+        target: emergency stop button
+    audio_ref: null
+
+  - id: exact-ko-en
+    category: exact
+    domain: factory-safety
+    source_language: ko
+    target_language: en
+    source: 비상 정지 버튼을 누르세요.
+    expected_terms:
+      - term_id: emergency_stop_button
+        target: emergency stop button
+    audio_ref: null
+
+  - id: overlap-vi-en
+    category: overlap
+    domain: factory-safety
+    source_language: vi
+    target_language: en
+    source: Kiểm tra nút dừng khẩn cấp và nút dừng.
+    expected_terms:
+      - term_id: emergency_stop_button
+        target: emergency stop button
+      - term_id: stop_button
+        target: stop button
+    audio_ref: null
+
+  - id: cross-chunk-vi-en
+    category: cross_chunk
+    domain: factory-safety
+    source_language: vi
+    target_language: en
+    chunks:
+      - Hãy nhấn nút dừng
+      - Hãy nhấn nút dừng khẩn
+      - Hãy nhấn nút dừng khẩn cấp
+    expected_terms:
+      - term_id: emergency_stop_button
+        target: emergency stop button
+    audio_ref: null
+
+  - id: aliases-vi-en
+    category: alias
+    domain: factory-maintenance
+    source_language: vi
+    target_language: en
+    source: Kiểm tra em năm stack và PLC S7 1200.
+    expected_terms:
+      - term_id: m5stack
+        target: M5Stack
+      - term_id: plc_s7_1200
+        target: PLC S7-1200
+    audio_ref: null
+
+  - id: preserve-en-vi
+    category: preserve
+    domain: factory-maintenance
+    source_language: en
+    target_language: vi
+    source: Check EtherCAT on the M5Stack controller.
+    expected_terms:
+      - term_id: ethercat
+        target: EtherCAT
+      - term_id: m5stack
+        target: M5Stack
+    audio_ref: null
+
+  - id: pivot-vi-ko
+    category: pivot
+    domain: factory-safety
+    source_language: vi
+    target_language: ko
+    route:
+      - vi
+      - en
+      - ko
+    source: Nhấn nút dừng khẩn cấp.
+    expected_hops:
+      en: emergency stop button
+      ko: 비상 정지 버튼
+    audio_ref: null
+
+  - id: profile-crane-construction
+    category: profile_conflict
+    domain: construction
+    source_language: en
+    target_language: vi
+    source: Move the crane to the loading area.
+    expected_terms:
+      - term_id: crane_construction
+        target: cần cẩu
+    excluded_term_ids:
+      - crane_biology
+    audio_ref: null
+
+  - id: profile-crane-biology
+    category: profile_conflict
+    domain: biology
+    source_language: en
+    target_language: vi
+    source: The crane is standing near the lake.
+    expected_terms:
+      - term_id: crane_biology
+        target: chim sếu
+    excluded_term_ids:
+      - crane_construction
+    audio_ref: null
+
+  - id: negative-near-term-vi
+    category: negative
+    domain: factory-safety
+    source_language: vi
+    target_language: en
+    source: Hãy dừng lại để kiểm tra.
+    excluded_term_ids:
+      - emergency_stop_button
+      - stop_button
+    audio_ref: null
+
+  - id: placeholder-corruption
+    category: validator
+    domain: factory-maintenance
+    source_language: en
+    target_language: vi
+    source: Check EtherCAT and M5Stack.
+    expected_placeholders:
+      - __TERM_0000__
+      - __TERM_0001__
+    corrupted_outputs:
+      - Check __TERM_0000__.
+      - Check __term_0000__ and __TERM_0001__.
+      - Check __TERM_0000__ and __TERM_0000__.
+      - Check __TERM_ 0000__ and __TERM_0001__.
+
+  - id: tts-display-spoken
+    category: spoken_form
+    domain: factory-maintenance
+    source_language: en
+    target_language: vi
+    source: Start PLC S7-1200 on M5Stack.
+    expected_display: Khởi động PLC S7-1200 trên M5Stack.
+    expected_spoken_terms:
+      plc_s7_1200: pi eo xi ét bảy một hai không không
+      m5stack: em năm stack

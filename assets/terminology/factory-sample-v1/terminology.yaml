@@ -1,0 +1,286 @@
+bundle_id: factory-sample-v1
+schema_version: 1
+description: Sample terminology bundle for OneVoice development and benchmarks.
+default_domains:
+  - factory-safety
+  - factory-maintenance
+
+entries:
+  - id: emergency_stop_button
+    domain:
+      - factory-safety
+      - factory-maintenance
+    priority: 100
+    translation_policy: preferred_term
+    forms:
+      vi:
+        canonical: nút dừng khẩn cấp
+        aliases:
+          - nút E-stop
+          - E-stop
+        asr_boost: 1.8
+      en:
+        canonical: emergency stop button
+        aliases:
+          - E-stop button
+          - emergency-stop button
+        asr_boost: 1.8
+      zh:
+        canonical: 紧急停止按钮
+        aliases:
+          - 急停按钮
+        asr_boost: 1.8
+      ko:
+        canonical: 비상 정지 버튼
+        aliases:
+          - 비상정지 버튼
+        asr_boost: 1.8
+    tts:
+      vi:
+        spoken_form: nút dừng khẩn cấp
+      en:
+        spoken_form: emergency stop button
+
+  - id: stop_button
+    domain:
+      - factory-safety
+    priority: 40
+    translation_policy: preferred_term
+    forms:
+      vi:
+        canonical: nút dừng
+        aliases: []
+      en:
+        canonical: stop button
+        aliases: []
+      zh:
+        canonical: 停止按钮
+        aliases: []
+      ko:
+        canonical: 정지 버튼
+        aliases: []
+
+  - id: m5stack
+    domain:
+      - factory-maintenance
+    priority: 90
+    translation_policy: display_preserve_speech_override
+    forms:
+      vi:
+        canonical: M5Stack
+        aliases:
+          - M 5 Stack
+          - em năm stack
+        asr_boost: 2.0
+      en:
+        canonical: M5Stack
+        aliases:
+          - M 5 Stack
+        asr_boost: 2.0
+      zh:
+        canonical: M5Stack
+        aliases:
+          - M5 Stack
+        asr_boost: 2.0
+      ko:
+        canonical: M5Stack
+        aliases:
+          - M5 스택
+        asr_boost: 2.0
+    tts:
+      vi:
+        spoken_form: em năm stack
+      en:
+        spoken_form: M five stack
+      zh:
+        spoken_form: M 五 Stack
+      ko:
+        spoken_form: 엠 파이브 스택
+
+  - id: plc_s7_1200
+    domain:
+      - factory-maintenance
+    priority: 95
+    translation_policy: display_preserve_speech_override
+    forms:
+      vi:
+        canonical: PLC S7-1200
+        aliases:
+          - PLC S7 1200
+          - S7-1200
+        asr_boost: 2.0
+      en:
+        canonical: PLC S7-1200
+        aliases:
+          - PLC S7 1200
+          - S7-1200
+        asr_boost: 2.0
+      zh:
+        canonical: PLC S7-1200
+        aliases:
+          - PLC S7 1200
+        asr_boost: 2.0
+      ko:
+        canonical: PLC S7-1200
+        aliases:
+          - PLC S7 1200
+        asr_boost: 2.0
+    tts:
+      vi:
+        spoken_form: pi eo xi ét bảy một hai không không
+      en:
+        spoken_form: P L C S seven twelve hundred
+
+  - id: ethercat
+    domain:
+      - factory-maintenance
+    priority: 90
+    translation_policy: preserve
+    forms:
+      vi:
+        canonical: EtherCAT
+        aliases:
+          - Ether CAT
+        asr_boost: 2.0
+      en:
+        canonical: EtherCAT
+        aliases:
+          - Ether CAT
+        asr_boost: 2.0
+      zh:
+        canonical: EtherCAT
+        aliases:
+          - Ether CAT
+        asr_boost: 2.0
+      ko:
+        canonical: EtherCAT
+        aliases:
+          - Ether CAT
+        asr_boost: 2.0
+
+  - id: encoder
+    domain:
+      - factory-maintenance
+    priority: 60
+    translation_policy: preferred_term
+    forms:
+      vi:
+        canonical: bộ mã hóa
+        aliases:
+          - encoder
+      en:
+        canonical: encoder
+        aliases: []
+      zh:
+        canonical: 编码器
+        aliases: []
+      ko:
+        canonical: 엔코더
+        aliases:
+          - 인코더
+
+  - id: conveyor
+    domain:
+      - factory-maintenance
+      - warehouse-logistics
+    priority: 60
+    translation_policy: preferred_term
+    forms:
+      vi:
+        canonical: băng tải
+        aliases:
+          - băng chuyền
+      en:
+        canonical: conveyor
+        aliases:
+          - conveyor belt
+      zh:
+        canonical: 传送带
+        aliases:
+          - 输送带
+      ko:
+        canonical: 컨베이어
+        aliases:
+          - 컨베이어 벨트
+
+  - id: crane_construction
+    domain:
+      - construction
+      - warehouse-logistics
+    priority: 70
+    translation_policy: preferred_term
+    forms:
+      vi:
+        canonical: cần cẩu
+        aliases: []
+      en:
+        canonical: crane
+        aliases: []
+      zh:
+        canonical: 起重机
+        aliases: []
+      ko:
+        canonical: 크레인
+        aliases: []
+
+  - id: crane_biology
+    domain:
+      - biology
+    priority: 70
+    translation_policy: preferred_term
+    forms:
+      vi:
+        canonical: chim sếu
+        aliases:
+          - con sếu
+      en:
+        canonical: crane
+        aliases: []
+      zh:
+        canonical: 鹤
+        aliases: []
+      ko:
+        canonical: 두루미
+        aliases: []
+
+  - id: windsurfing
+    domain:
+      - test
+    priority: 100
+    translation_policy: preserve
+    forms:
+      vi:
+        canonical: windsurfing
+        aliases: []
+      en:
+        canonical: windsurfing
+        aliases:
+          - wind surfing
+          - winssurfing
+        asr_boost: 2.0
+      zh:
+        canonical: windsurfing
+        aliases: []
+      ko:
+        canonical: windsurfing
+        aliases: []
+
+  - id: outdoor_life
+    domain:
+      - test
+    priority: 100
+    translation_policy: preserve
+    forms:
+      vi:
+        canonical: Outdoor Life
+        aliases: []
+      en:
+        canonical: Outdoor Life
+        aliases: []
+        asr_boost: 2.0
+      zh:
+        canonical: Outdoor Life
+        aliases: []
+      ko:
+        canonical: Outdoor Life
+        aliases: []

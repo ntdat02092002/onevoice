@@ -51,6 +51,24 @@ def test_passthrough_vad_honors_requested_endpoint() -> None:
     assert segments[0].samples.size == 640
 
 
+def test_passthrough_endpoint_carries_configured_acoustic_context() -> None:
+    audio = AudioConfig()
+    config = VadConfig(semantic_endpoint_context_ms=20)
+    vad = PassthroughVad(config, audio)
+    first = vad.process(_chunk(640))[0]
+
+    vad.request_endpoint(
+        started_at=first.started_at,
+        cut_sample=640,
+    )
+    final = vad.process(_chunk(320, sequence=1))[0]
+    carried = vad.process(_chunk(320, sequence=2))[0]
+
+    assert final.samples.size == 640
+    assert carried.samples.size == 960
+    assert carried.context_samples == 320
+
+
 def test_webrtc_endpoint_cuts_at_snapshot_and_carries_buffered_suffix() -> None:
     audio = AudioConfig(frame_ms=20, asr_chunk_ms=20)
     vad = WebRtcVadBackend(VadConfig(min_speech_ms=20), audio)
@@ -80,6 +98,7 @@ def test_webrtc_endpoint_cuts_at_snapshot_and_carries_buffered_suffix() -> None:
     assert not carried.is_final
     assert carried.started_at != final.started_at
     assert carried.samples.size == 960
+    assert carried.context_samples == 0
 
 
 def test_webrtc_ignores_endpoint_for_an_old_utterance_identity() -> None:
@@ -209,7 +228,7 @@ def test_pipeline_endpoint_carries_snapshot_sample_cursor() -> None:
                 AsrWordTiming("unfinished", 0.8, 1.0),
                 AsrWordTiming("tail", 1.1, 1.3),
             ),
-            0.7,
+            0.3,
         ),
         (
             2,

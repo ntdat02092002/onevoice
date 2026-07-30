@@ -54,6 +54,7 @@ class SpeechSegment:
     ended_at: float
     is_final: bool = False
     is_endpoint_cut: bool = False
+    context_samples: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +101,7 @@ class TranslationRequest:
     source_revision: int
     is_final: bool
     requested_at: float = field(default_factory=monotonic)
+    stream_id: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +114,13 @@ class TranslationUpdate:
     is_final: bool
     started_at: float
     completed_at: float = field(default_factory=monotonic)
+    terminology_matches: int = 0
+    terminology_hard_matches: int = 0
+    terminology_expected_placeholders: int = 0
+    terminology_retries: int = 0
+    terminology_fallbacks: int = 0
+    terminology_hops: int = 0
+    sentence_cache_hits: int = 0
 
     @property
     def latency_ms(self) -> float:

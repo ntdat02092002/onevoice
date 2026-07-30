@@ -9,6 +9,10 @@ import numpy as np
 
 from onevoice.config import AsrConfig
 from onevoice.models import AsrUpdate, AsrWordTiming, SpeechSegment
+from onevoice.sherpa_models import (
+    DEFAULT_SHERPA_STREAMING_MODEL_BY_LANGUAGE,
+    SHERPA_STREAMING_MODELS,
+)
 from onevoice.text import tokenize_text
 
 
@@ -33,6 +37,9 @@ def asr_model_options(backend: str, language: str) -> tuple[str, ...]:
         return DOLPHIN_MODELS
     if backend == "faster_whisper":
         return FASTER_WHISPER_MODELS
+    if backend == "sherpa_onnx":
+        model = DEFAULT_SHERPA_STREAMING_MODEL_BY_LANGUAGE.get(language)
+        return (model,) if model else ("auto",)
     if backend == "fake":
         return ("fake",)
     return ()
@@ -62,6 +69,24 @@ def validate_asr_selection(backend: str, model: str, language: str) -> None:
             raise ValueError(
                 f"Dolphin model {model!r} is unsupported; supported models: "
                 f"{', '.join(DOLPHIN_MODELS)}"
+            )
+    elif backend == "sherpa_onnx":
+        if language not in DEFAULT_SHERPA_STREAMING_MODEL_BY_LANGUAGE:
+            raise ValueError(
+                "sherpa_onnx streaming Zipformer requires vi, en, zh, or ko"
+            )
+        if model == "auto":
+            return
+        try:
+            spec = SHERPA_STREAMING_MODELS[model]
+        except KeyError as exc:
+            raise ValueError(
+                f"sherpa_onnx streaming model {model!r} is unsupported"
+            ) from exc
+        if spec.language != language:
+            raise ValueError(
+                f"sherpa_onnx model {model!r} supports {spec.language!r}, "
+                f"not {language!r}"
             )
     elif backend in ("faster_whisper", "fake") and not model.strip():
         raise ValueError(f"{backend} requires a non-empty model name")

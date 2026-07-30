@@ -12,6 +12,7 @@ vad:
   max_utterance_seconds: 15
   semantic_endpoint_enabled: true
   semantic_endpoint_sentences: 2
+  semantic_endpoint_context_ms: null
 asr:
   backend: moonshine
   model: auto
@@ -23,6 +24,15 @@ asr:
   update_interval: 0.5
   decoding_method: attention
   offline: false
+  sherpa:
+    recognizer_mode: online_transducer
+    provider: cpu
+    num_threads: 2
+    decoding_method: greedy_search
+    max_active_paths: 4
+    final_padding_ms: 500
+    cache_dir: .cache/onevoice/asr
+    punctuation_enabled: true
 commit:
   backend: local_agreement
   agreement_updates: 2
@@ -69,3 +79,21 @@ tts:
   sentence_boundary_only: true
   final_only: true
   emission_mode: final_utterance
+terminology:
+  enabled: false
+  bundle_path: null
+  domain: null
+  matching:
+    normalization: unicode_nfc
+    longest_match_first: true
+    case_sensitive_for_codes: true
+  mt:
+    strategy: placeholder_with_validation
+    placeholder_formats:
+      - "__TERM_{id:04d}__"
+      - "OVT{id:04d}OVT"
+      - "ZXTERM{id:04d}ZX"
+    validate_coverage: true
+    pivot_canonicalization: true
+    validate_order: false
+    on_validation_error: segment_fallback

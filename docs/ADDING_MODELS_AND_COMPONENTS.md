@@ -318,7 +318,13 @@ class MyTtsBackend:
 
 `PhraseTtsPolicy` global default dùng `emission_mode: final_utterance`. Profile `realtime_conversation.yaml` và Streamlit dùng `stable_sentence`: chỉ một target sentence hoàn chỉnh giống nhau qua số revision cấu hình mới được reserve; final vẫn flush tail chưa có punctuation. `stable_phrase` là mode chủ động hơn nhưng không phải realtime default. `max_chunk_tokens=24` là hard maximum kể cả ở final hoặc với câu dài; UI ghép các internal chunk của cùng một câu rồi autoplay ngay, không chờ toàn utterance. Hai field `final_only` và `sentence_boundary_only` vẫn được đọc khi `emission_mode: null` để tương thích config cũ. VAD semantic endpoint chỉ đóng waveform/utterance và không quyết định TTS stability.
 
-MT mặc định dùng hybrid wait-k: đủ context và gặp sentence boundary thì chạy ngay; nếu chưa hết câu, policy vẫn trigger theo `update_tokens` + minimum interval hoặc `timeout_ms`. Queue chỉ giữ pending partial mới nhất của mỗi utterance, nhưng giữ mọi final theo FIFO. Backend dịch partial prefix đúng một lần; chỉ final mới split theo sentence và phục hồi terminal punctuation.
+MT mặc định dùng hybrid wait-k: đủ context và gặp sentence boundary thì chạy
+ngay; nếu chưa hết câu, policy vẫn trigger theo `update_tokens` + minimum
+interval hoặc `timeout_ms`. Queue chỉ giữ pending partial mới nhất của mỗi
+utterance, nhưng giữ mọi final theo FIFO. Không bật terminology thì backend dịch
+partial prefix đúng một lần. Khi có terminology, OPUS/M2M100 split partial theo
+sentence: cache exact completed sentence theo `TranslationRequest.stream_id`,
+chỉ dịch lại mutable tail, rồi final tái sử dụng cache và xóa stream state.
 
 Vòng đời mỗi TTS phrase là `reserved -> synthesized -> acknowledged`:
 

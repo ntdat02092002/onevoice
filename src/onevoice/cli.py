@@ -17,7 +17,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path)
     parser.add_argument("--source", choices=("auto", "vi", "en", "zh", "ko"), default="vi")
     parser.add_argument("--target", choices=("vi", "en", "zh", "ko"), default="en")
-    parser.add_argument("--asr-backend", choices=("moonshine", "dolphin", "faster_whisper", "fake"))
+    parser.add_argument(
+        "--asr-backend",
+        choices=(
+            "moonshine",
+            "sherpa_onnx",
+            "dolphin",
+            "faster_whisper",
+            "fake",
+        ),
+    )
     parser.add_argument("--asr-model", help="Model/architecture name for the selected ASR backend")
     parser.add_argument("--mt-backend", choices=("opus_ct2", "m2m100", "fake"))
     parser.add_argument("--tts", action="store_true", help="Enable phrase-level translated speech")
@@ -38,6 +47,7 @@ def main() -> int:
         if not args.asr_model:
             config.asr.model = {
                 "moonshine": "auto",
+                "sherpa_onnx": "auto",
                 "dolphin": "base",
                 "faster_whisper": "base",
                 "fake": "fake",

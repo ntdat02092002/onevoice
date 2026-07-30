@@ -27,6 +27,15 @@ def test_default_config() -> None:
     assert config.tts.backend == "sherpa_onnx"
     assert config.tts.emission_mode == "final_utterance"
     assert config.tts.agreement_updates == 2
+    assert not config.terminology.enabled
+    assert config.terminology.bundle_path is None
+    assert config.terminology.matching.normalization == "unicode_nfc"
+    assert config.terminology.matching.longest_match_first
+    assert config.terminology.matching.case_sensitive_for_codes
+    assert config.terminology.mt.strategy == "placeholder_with_validation"
+    assert len(config.terminology.mt.placeholder_formats) == 3
+    assert config.terminology.mt.validate_coverage
+    assert config.terminology.mt.pivot_canonicalization
 
 
 def test_registry_reports_available_backends() -> None:
@@ -40,6 +49,12 @@ def test_registry_reports_available_backends() -> None:
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
+        (
+            lambda config: setattr(
+                config.asr.sherpa, "recognizer_mode", "offline_transducer"
+            ),
+            "recognizer_mode",
+        ),
         (lambda config: setattr(config.audio, "asr_chunk_ms", 0), "asr_chunk_ms"),
         (lambda config: setattr(config.audio, "queue_seconds", 0), "queue_seconds"),
         (lambda config: setattr(config.commit, "agreement_updates", 0), "agreement_updates"),
@@ -49,6 +64,28 @@ def test_registry_reports_available_backends() -> None:
         (lambda config: setattr(config.translation, "timeout_ms", 0), "timing"),
         (lambda config: setattr(config.translation, "max_new_tokens", 0), "max_new_tokens"),
         (lambda config: setattr(config.tts, "emission_mode", "unknown"), "emission_mode"),
+        (
+            lambda config: setattr(config.terminology, "enabled", True),
+            "terminology.bundle_path",
+        ),
+        (
+            lambda config: setattr(
+                config.terminology.matching, "normalization", "unknown"
+            ),
+            "terminology.matching.normalization",
+        ),
+        (
+            lambda config: setattr(
+                config.terminology.matching, "longest_match_first", False
+            ),
+            "terminology.matching.longest_match_first",
+        ),
+        (
+            lambda config: setattr(
+                config.terminology.mt, "placeholder_formats", []
+            ),
+            "placeholder_formats",
+        ),
     ],
 )
 def test_pipeline_config_rejects_invalid_runtime_limits(mutate, message: str) -> None:
@@ -71,12 +108,43 @@ def test_profile_deep_merges_over_default_yaml(tmp_path: Path) -> None:
     assert config.vad.semantic_endpoint_sentences == 1
     assert config.tts.speed == 0.85
     assert config.asr.language == "vi"
+    assert config.asr.sherpa.recognizer_mode == "online_transducer"
+    assert config.asr.sherpa.final_padding_ms == 500
+    assert config.asr.sherpa.cache_dir == ".cache/onevoice/asr"
     assert config.asr.model == "auto"
     assert config.asr.device == "cpu"
+    assert config.asr.sherpa.num_threads == 2
     assert config.translation.model == "opus-auto"
     assert config.tts.backend == "sherpa_onnx"
     assert config.tts.cache_dir == ".cache/onevoice/tts"
     assert config.tts.max_chunk_tokens == 24
+    assert not config.terminology.enabled
+    assert config.terminology.matching.case_sensitive_for_codes
+
+
+def test_profile_deep_merges_nested_terminology_settings(tmp_path: Path) -> None:
+    profile = tmp_path / "terminology-profile.yaml"
+    profile.write_text(
+        "terminology:\n"
+        "  enabled: true\n"
+        "  bundle_path: assets/terminology/factory-sample-v1/terminology.yaml\n"
+        "  domain: factory-safety\n"
+        "  matching:\n"
+        "    case_sensitive_for_codes: false\n"
+        "  mt:\n"
+        "    validate_order: true\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(profile)
+
+    assert config.terminology.enabled
+    assert config.terminology.domain == "factory-safety"
+    assert not config.terminology.matching.case_sensitive_for_codes
+    assert config.terminology.matching.normalization == "unicode_nfc"
+    assert config.terminology.matching.longest_match_first
+    assert config.terminology.mt.validate_order
+    assert config.terminology.mt.validate_coverage
 
 
 @pytest.mark.parametrize(
@@ -94,6 +162,7 @@ def test_shipped_profiles_deep_merge_default_model_fields(
     assert config.vad.semantic_endpoint_sentences == sentences
     assert config.asr.model == "auto"
     assert config.asr.language == "vi"
+    assert config.asr.sherpa.punctuation_enabled
     assert config.translation.model == "opus-auto"
     assert config.tts.cache_dir == ".cache/onevoice/tts"
 

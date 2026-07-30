@@ -34,6 +34,12 @@ LANGUAGES = {
 }
 
 REALTIME_PROFILE = Path(__file__).resolve().parents[1] / "config" / "realtime_conversation.yaml"
+SAMPLE_TERMINOLOGY_BUNDLE = (
+    Path("assets")
+    / "terminology"
+    / "factory-sample-v1"
+    / "terminology.yaml"
+)
 PROFILE_DEFAULTS = load_config(REALTIME_PROFILE)
 
 
@@ -143,7 +149,7 @@ with st.sidebar:
     target = target_options[target_label]
     asr_backend = st.selectbox(
         "ASR backend",
-        ("moonshine", "dolphin", "faster_whisper", "fake"),
+        ("moonshine", "sherpa_onnx", "dolphin", "faster_whisper", "fake"),
         disabled=controls_locked,
     )
     asr_models = asr_model_options(asr_backend, source)
@@ -155,6 +161,22 @@ with st.sidebar:
         asr_capability_error = str(exc)
         st.error(asr_capability_error)
     mt_backend = st.selectbox("MT backend", ("opus_ct2", "m2m100", "fake"), disabled=controls_locked)
+    terminology_enabled = st.checkbox(
+        "Bật terminology dictionary",
+        value=False,
+        disabled=controls_locked,
+        help="Bảo vệ thuật ngữ qua MT và khôi phục canonical form theo ngôn ngữ đích.",
+    )
+    terminology_domain = st.selectbox(
+        "Terminology domain",
+        ("factory-safety", "factory-maintenance", "test"),
+        disabled=controls_locked or not terminology_enabled,
+    )
+    terminology_bundle = st.text_input(
+        "Terminology bundle",
+        value=str(SAMPLE_TERMINOLOGY_BUNDLE),
+        disabled=controls_locked or not terminology_enabled,
+    )
     tts_enabled = st.checkbox("Bật phát giọng dịch (TTS)", value=False, disabled=controls_locked)
     tts_backend = st.selectbox(
         "TTS backend",
@@ -192,6 +214,8 @@ with st.sidebar:
             config.asr.model = asr_model
             config.asr.device = device
             config.asr.compute_type = compute_type
+            if asr_backend == "sherpa_onnx":
+                config.asr.sherpa.provider = device
             config.asr.language = source
             config.asr.offline = offline
             config.vad.semantic_endpoint_enabled = semantic_endpoint
@@ -205,6 +229,13 @@ with st.sidebar:
             config.translation.device = device
             config.translation.compute_type = compute_type
             config.translation.offline = offline
+            config.terminology.enabled = terminology_enabled
+            config.terminology.bundle_path = (
+                terminology_bundle if terminology_enabled else None
+            )
+            config.terminology.domain = (
+                terminology_domain if terminology_enabled else None
+            )
             config.tts.enabled = tts_enabled
             config.tts.backend = tts_backend
             config.tts.device = device
