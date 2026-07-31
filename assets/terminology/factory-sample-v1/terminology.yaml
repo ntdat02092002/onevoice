@@ -264,6 +264,11 @@ entries:
       ko:
         canonical: windsurfing
         aliases: []
+    tts:
+      vi:
+        spoken_form: lướt ván buồm
+      en:
+        spoken_form: wind surfing
 
   - id: outdoor_life
     domain:
@@ -284,3 +289,6 @@ entries:
       ko:
         canonical: Outdoor Life
         aliases: []
+    tts:
+      vi:
+        spoken_form: ao đờ lai-ph

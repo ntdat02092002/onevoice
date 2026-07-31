@@ -32,6 +32,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tts", action="store_true", help="Enable phrase-level translated speech")
     parser.add_argument("--tts-backend", choices=("sherpa_onnx", "fake"), default="sherpa_onnx")
     parser.add_argument("--tts-model-dir", type=Path, help="VITS/Piper asset directory")
+    parser.add_argument(
+        "--terminology-bundle",
+        type=Path,
+        help="Validate and compile this terminology bundle at pipeline start",
+    )
+    parser.add_argument(
+        "--terminology-domain",
+        help="Active terminology domain (requires --terminology-bundle)",
+    )
     parser.add_argument("--realtime", action="store_true", help="Pace input at the original audio rate")
     return parser
 
@@ -63,6 +72,14 @@ def main() -> int:
         config.tts.enabled = True
         config.tts.backend = args.tts_backend
         config.tts.model_dir = str(args.tts_model_dir) if args.tts_model_dir else None
+    if args.terminology_domain and not args.terminology_bundle:
+        raise SystemExit(
+            "--terminology-domain requires --terminology-bundle"
+        )
+    if args.terminology_bundle:
+        config.terminology.enabled = True
+        config.terminology.bundle_path = str(args.terminology_bundle)
+        config.terminology.domain = args.terminology_domain
     pipeline = RealtimePipeline(config)
     pipeline.start()
 

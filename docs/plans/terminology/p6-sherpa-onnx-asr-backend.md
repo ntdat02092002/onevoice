@@ -1,11 +1,13 @@
 # P7 — Zipformer terminology và native hotwords
 
-Trạng thái: **Planned — chưa implement**
+Trạng thái: **Done — native hotwords đã được tích hợp**
 
 > Backend foundation, model download, registry/config và decode không terminology
 > đã được tách lên [P3](p3-zipformer-asr-backend.md). Tài liệu này giữ phần
 > compatibility research và kế hoạch hotwords/terminology sau khi P3 ổn định;
 > các mục B0–B4 bên dưới là bối cảnh lịch sử.
+>
+> Chi tiết phần đã triển khai và smoke test: [P7 implementation report](p7-implementation-report.md).
 
 Phụ thuộc:
 
@@ -420,14 +422,17 @@ Model không đạt license gate vẫn có thể dùng cho research benchmark nh
 
 ## Definition of Done
 
-- Một adapter hỗ trợ rõ ràng online và offline Transducer.
-- Streaming model chỉ feed unseen audio tail.
-- Official offline model không bị quảng bá nhầm thành true streaming.
-- Hotwords hoạt động ở utterance boundary và có negative tests.
-- Model manifest pin source, license và checksum.
-- Existing ASR backends/test suite không regression.
-- Có benchmark report và quyết định model riêng, không gắn cứng backend với một
-  model duy nhất.
+- [x] Online streaming adapter chỉ feed unseen audio tail.
+- [x] Native hotwords hoạt động ở utterance boundary và có positive/OOV tests.
+- [x] BPE/cjkchar artifact được validate theo model.
+- [x] Existing ASR backends/test suite không regression.
+- [x] Có real-model A/B canary và smoke test vi/en/zh/ko.
+- [ ] Benchmark production đủ term recall/precision, false insertion, WER/CER,
+  latency và thiết bị đích.
+- [ ] Model/license/distribution gate được duyệt trước khi đổi production default.
+
+Hai mục chưa đánh dấu là rollout gate, không chặn P7 integration được dùng ở
+experimental/canary mode.
 
 ## Tài liệu tham khảo
 

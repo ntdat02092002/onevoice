@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import sys
 
 import numpy as np
 import pytest
@@ -67,9 +68,13 @@ class _FakeRecognizer:
     ) -> None:
         self.texts = texts
         self.streams: list[_FakeStream] = []
+        self.hotword_inputs: list[str | None] = []
         self.decode_count = 0
 
-    def create_stream(self) -> _FakeStream:
+    def create_stream(
+        self, hotwords: str | None = None
+    ) -> _FakeStream:
+        self.hotword_inputs.append(hotwords)
         stream = _FakeStream()
         self.streams.append(stream)
         return stream
@@ -148,6 +153,112 @@ def test_sherpa_loads_online_transducer_without_hotwords(
     assert captured["decoding_method"] == "greedy_search"
     assert captured["provider"] == "cpu"
     assert "hotwords_file" not in captured
+
+
+def test_native_hotwords_require_modified_beam_search() -> None:
+    backend = SherpaOnnxZipformerAsrBackend(_config("en"))
+
+    with pytest.raises(ValueError, match="modified_beam_search"):
+        backend.configure_native_hotwords(
+            (
+                SimpleNamespace(
+                    text="WINDSURFING",
+                    score=2.0,
+                    token_count=1,
+                ),
+            ),
+            global_score=1.5,
+        )
+
+
+def test_sherpa_creates_stream_with_profile_hotwords(
+    tmp_path: Path,
+) -> None:
+    config = _config("zh")
+    config.model_dir = str(tmp_path)
+    config.sherpa.decoding_method = "modified_beam_search"
+    _assets(tmp_path, config)
+    backend = SherpaOnnxZipformerAsrBackend(config)
+    (tmp_path / backend.model_spec.tokens).write_text(
+        "<blk> 0\n紧 1\n急 2\n停 3\n止 4\n按 5\n钮 6\n",
+        encoding="utf-8",
+    )
+    recognizer = _FakeRecognizer(("你好",))
+    captured: dict[str, object] = {}
+
+    class Factory:
+        @staticmethod
+        def from_transducer(**kwargs):
+            captured.update(kwargs)
+            return recognizer
+
+    backend._sherpa = SimpleNamespace(OnlineRecognizer=Factory)
+    backend.configure_native_hotwords(
+        (
+            SimpleNamespace(
+                text="紧急停止按钮",
+                score=1.8,
+                token_count=6,
+            ),
+            SimpleNamespace(
+                text="不存在",
+                score=1.5,
+                token_count=3,
+            ),
+        ),
+        global_score=1.5,
+    )
+    backend.load()
+    backend.transcribe(_segment(160), "zh")
+
+    assert captured["decoding_method"] == "modified_beam_search"
+    assert captured["modeling_unit"] == "cjkchar"
+    assert captured["bpe_vocab"] == ""
+    assert recognizer.hotword_inputs == ["紧急停止按钮 :1.8"]
+    metrics = backend.take_metrics()
+    assert metrics["asr_hotword_term_count"] == 1
+    assert metrics["asr_hotword_rejection_count"] == 1
+    assert metrics["asr_hotword_stream_count"] == 1
+
+
+def test_bpe_hotword_vocab_is_exported_from_model(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config("en")
+    backend = SherpaOnnxZipformerAsrBackend(config)
+    (tmp_path / "bpe.model").write_bytes(b"fake")
+
+    class Processor:
+        def __init__(self, *, model_file):
+            assert model_file.endswith("bpe.model")
+
+        @staticmethod
+        def get_piece_size():
+            return 2
+
+        @staticmethod
+        def id_to_piece(index):
+            return ("<unk>", "▁TEST")[index]
+
+        @staticmethod
+        def get_score(index):
+            return (0.0, -1.5)[index]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentencepiece",
+        SimpleNamespace(SentencePieceProcessor=Processor),
+    )
+
+    modeling_unit, vocab = backend._ensure_hotword_assets(
+        tmp_path
+    )
+
+    assert modeling_unit == "bpe"
+    assert Path(vocab).read_text(encoding="utf-8") == (
+        "<unk>\t0.0\n▁TEST\t-1.5\n"
+    )
 
 
 def test_streaming_backend_feeds_only_unseen_audio_tail() -> None:

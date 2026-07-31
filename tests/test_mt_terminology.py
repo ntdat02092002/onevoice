@@ -465,4 +465,8 @@ def test_pipeline_loads_bundle_and_injects_terminology_into_translator() -> None
     )
 
     assert pipeline.terminology_manager is not None
+    assert pipeline.terminology_build is not None
+    assert pipeline.terminology_build.bundle_id == "factory-sample-v1"
+    assert pipeline.terminology_build.bundle_path == SAMPLE_BUNDLE.as_posix()
+    assert pipeline.metrics_snapshot()["terminology_build_count"] == 1
     assert update.text == "[vi] nút dừng khẩn cấp"

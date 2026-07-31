@@ -257,3 +257,28 @@ class TermPrefixTrie:
             if node is not None and node.children:
                 return start
         return None
+
+    def term_spans(
+        self, tokens: str | Iterable[str]
+    ) -> tuple[tuple[int, int], ...]:
+        """Return non-overlapping complete terms, preferring longest matches."""
+        values = self._tokens(tokens)
+        spans: list[tuple[int, int]] = []
+        start = 0
+        while start < len(values):
+            node = self._root
+            cursor = start
+            longest_end: int | None = None
+            while cursor < len(values):
+                node = node.children.get(values[cursor])
+                if node is None:
+                    break
+                cursor += 1
+                if node.terminal_ids:
+                    longest_end = cursor
+            if longest_end is None:
+                start += 1
+                continue
+            spans.append((start, longest_end))
+            start = longest_end
+        return tuple(spans)

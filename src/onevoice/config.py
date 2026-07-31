@@ -60,6 +60,7 @@ class CommitConfig:
     backend: str = "local_agreement"
     agreement_updates: int = 2
     hold_tokens: int = 1
+    term_prefix_timeout_ms: int = 1_500
 
 
 @dataclass(slots=True)
@@ -118,6 +119,18 @@ class TerminologyMatchingConfig:
 
 
 @dataclass(slots=True)
+class TerminologyAsrConfig:
+    initial_prompt_enabled: bool = True
+    post_correction_enabled: bool = True
+    native_hotwords_enabled: bool = True
+    max_prompt_terms: int = 32
+    max_prompt_tokens: int = 128
+    max_hotword_terms: int = 64
+    max_hotword_tokens: int = 256
+    hotword_score: float = 1.5
+
+
+@dataclass(slots=True)
 class TerminologyMtConfig:
     strategy: str = "placeholder_with_validation"
     placeholder_formats: list[str] = field(
@@ -134,6 +147,11 @@ class TerminologyMtConfig:
 
 
 @dataclass(slots=True)
+class TerminologyTtsConfig:
+    strategy: str = "spoken_form"
+
+
+@dataclass(slots=True)
 class TerminologyConfig:
     enabled: bool = False
     bundle_path: str | None = None
@@ -141,7 +159,13 @@ class TerminologyConfig:
     matching: TerminologyMatchingConfig = field(
         default_factory=TerminologyMatchingConfig
     )
+    asr: TerminologyAsrConfig = field(
+        default_factory=TerminologyAsrConfig
+    )
     mt: TerminologyMtConfig = field(default_factory=TerminologyMtConfig)
+    tts: TerminologyTtsConfig = field(
+        default_factory=TerminologyTtsConfig
+    )
 
 
 @dataclass(slots=True)
@@ -183,6 +207,10 @@ class PipelineConfig:
             raise ValueError("commit.agreement_updates must be at least 1")
         if self.commit.hold_tokens < 0:
             raise ValueError("commit.hold_tokens must be non-negative")
+        if self.commit.term_prefix_timeout_ms < 0:
+            raise ValueError(
+                "commit.term_prefix_timeout_ms must be non-negative"
+            )
         if self.translation.target_language not in ("vi", "en", "zh", "ko"):
             raise ValueError("target language must be vi, en, zh, or ko")
         if self.translation.source_language not in ("auto", "vi", "en", "zh", "ko"):
@@ -257,6 +285,26 @@ class PipelineConfig:
             raise ValueError(
                 "terminology.matching.longest_match_first must be true"
             )
+        if self.terminology.asr.max_prompt_terms < 1:
+            raise ValueError(
+                "terminology.asr.max_prompt_terms must be positive"
+            )
+        if self.terminology.asr.max_prompt_tokens < 1:
+            raise ValueError(
+                "terminology.asr.max_prompt_tokens must be positive"
+            )
+        if self.terminology.asr.max_hotword_terms < 1:
+            raise ValueError(
+                "terminology.asr.max_hotword_terms must be positive"
+            )
+        if self.terminology.asr.max_hotword_tokens < 1:
+            raise ValueError(
+                "terminology.asr.max_hotword_tokens must be positive"
+            )
+        if self.terminology.asr.hotword_score <= 0:
+            raise ValueError(
+                "terminology.asr.hotword_score must be positive"
+            )
         mt = self.terminology.mt
         if mt.strategy != "placeholder_with_validation":
             raise ValueError(
@@ -298,6 +346,10 @@ class PipelineConfig:
             raise ValueError(
                 "terminology.mt.pivot_canonicalization must be true when terminology is enabled"
             )
+        if self.terminology.tts.strategy != "spoken_form":
+            raise ValueError(
+                "terminology.tts.strategy must be spoken_form"
+            )
 
 
 T = TypeVar("T")
@@ -338,13 +390,23 @@ def _terminology_from_mapping(
         TerminologyMatchingConfig,
         data.pop("matching", None),
     )
+    asr = _from_mapping(
+        TerminologyAsrConfig,
+        data.pop("asr", None),
+    )
     mt = _from_mapping(
         TerminologyMtConfig,
         data.pop("mt", None),
     )
+    tts = _from_mapping(
+        TerminologyTtsConfig,
+        data.pop("tts", None),
+    )
     config = _from_mapping(TerminologyConfig, data)
     config.matching = matching
+    config.asr = asr
     config.mt = mt
+    config.tts = tts
     return config
 
 

@@ -46,6 +46,7 @@ tts = [
 ]
 sherpa-asr = [
   "sherpa-onnx>=1.13.4,<2",
+  "sentencepiece>=0.2,<1",
 ]
 dev = [
   "pytest>=8,<9",

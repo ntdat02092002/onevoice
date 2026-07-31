@@ -136,6 +136,11 @@ class TtsRequest:
     phrase_id: int = 0
     source_is_final: bool = False
     requested_at: float = field(default_factory=monotonic)
+    spoken_text: str | None = None
+
+    @property
+    def synthesis_text(self) -> str:
+        return self.spoken_text or self.text
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +155,7 @@ class TtsUpdate:
     started_at: float
     source_is_final: bool = False
     completed_at: float = field(default_factory=monotonic)
+    spoken_text: str | None = None
 
     def __post_init__(self) -> None:
         if self.samples.ndim != 1:

@@ -1,10 +1,10 @@
-# P3–P4 — Streaming Safety và TTS Spoken Form
+# P4–P5 — Streaming Safety và TTS Spoken Form
 
-Trạng thái: **Planned — chưa implement**
+Trạng thái: **Done — P4 và P5 đã implement**
 
-Phụ thuộc: P1; P3 nên triển khai sau P2.
+Phụ thuộc: P1; P4 nên triển khai sau P2.
 
-## P3 — Term-aware Stable Prefix
+## P4 — Term-aware Stable Prefix
 
 ### Mục tiêu
 
@@ -41,7 +41,7 @@ ASR partial history
 
 Không thay thế Local Agreement; chỉ bổ sung một safety check sau khi đã tính stable candidate.
 
-## P3 — Term-aware phrase chunking
+## P4 — Term-aware phrase chunking
 
 ### Mục tiêu
 
@@ -76,7 +76,7 @@ TranslationUpdate
 - `src/onevoice/policy.py`
 - target matcher/trie từ immutable profile.
 
-## P3 test plan
+## P4 test plan
 
 - Cross-ASR-chunk term.
 - `nút dừng` và `nút dừng khẩn cấp`.
@@ -89,14 +89,14 @@ TranslationUpdate
 - Term dài hơn maximum.
 - Revision mới không replay acknowledged phrase.
 
-## P3 exit criteria
+## P4 exit criteria
 
 - Không có committed partial term trong fixtures.
 - Không có TTS request chứa một phần của protected term.
 - Không phá semantic endpoint và rollback-free reservation hiện tại.
 - Đo được latency tăng thêm do term hold.
 
-## P4 — TTS spoken-form normalization
+## P5 — TTS spoken-form normalization
 
 ### Mục tiêu
 
@@ -142,14 +142,14 @@ spoken_text if present else text
 
 ### Model lexicon
 
-Custom phoneme/model lexicon không thuộc P4. Nó chỉ được triển khai sau khi:
+Custom phoneme/model lexicon không thuộc P5. Nó chỉ được triển khai sau khi:
 
 - TTS model/voice đã cố định;
 - tokens/phoneme inventory có checksum;
 - có pronunciation acceptance test;
 - bundle compatibility validation đã có.
 
-### P4 test plan
+### P5 test plan
 
 - Display/spoken split.
 - Acronym theo locale.
@@ -160,7 +160,7 @@ Custom phoneme/model lexicon không thuộc P4. Nó chỉ được triển khai 
 - Fake TTS nhận synthesis text nhưng event giữ display text.
 - Reservation prefix vẫn so sánh theo display text.
 
-### P4 exit criteria
+### P5 exit criteria
 
 - Spoken form không làm thay đổi subtitle/UI translation.
 - Backend synthesize đúng spoken text.

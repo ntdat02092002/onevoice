@@ -1,6 +1,6 @@
 # OneVoice Terminology Dictionary — Implementation Roadmap
 
-Trạng thái: **In progress — P0 đến P3 đã hoàn tất**
+Trạng thái: **In progress — P0 đến P8 đã hoàn tất**
 
 Tài liệu nguồn: [OneVoice_Terminology_Dictionary_Final_Report.docx](../../OneVoice_Terminology_Dictionary_Final_Report.docx)
 
@@ -38,11 +38,11 @@ Terminology không được triển khai như một bước `str.replace()` sau 
 | P1 | **Done** | Terminology core | Loader, validator, normalizer, matcher và domain profile |
 | P2 | **Done** | MT-first | Placeholder, validator, canonical restore và OPUS pivot per-hop |
 | P3 | **Done** | Streaming Zipformer độc lập | `OnlineRecognizer` cho vi/en/zh/ko; không nối terminology |
-| P4 | Planned | Streaming terminology safety | Stable Prefix và phrase chunking không cắt giữa term |
-| P5 | Planned | TTS spoken form | Tách display text khỏi synthesis text |
-| P6 | Planned | ASR terminology cho backend hiện tại | Prompt và post-correction có kiểm soát |
-| P7 | Planned | Zipformer terminology/hotwords | Đánh giá native hotwords sau khi backend P3 ổn định |
-| P8 | Planned | Lifecycle và vận hành | Hot-swap, compatibility manifest, UI/CLI và metrics |
+| P4 | **Done** | Streaming terminology safety | Stable Prefix và phrase chunking không cắt giữa term |
+| P5 | **Done** | TTS spoken form | Tách display text khỏi synthesis text |
+| P6 | **Done** | ASR terminology cho backend hiện tại | Prompt và exact-alias post-correction có kiểm soát |
+| P7 | **Done** | Zipformer terminology/hotwords | Native per-stream hotwords, tokenizer validation, bounded profile và metrics |
+| P8 | **Done** | Lifecycle và vận hành đơn giản | Stop/change/start, preflight compile, build identity, UI/CLI và metrics |
 | P9 | Deferred | R&D tùy chọn | Constrained decoding, retrieval, LLM glossary, phoneme control |
 
 ## Tài liệu chi tiết
@@ -55,8 +55,13 @@ Terminology không được triển khai như một bước `str.replace()` sau 
 - [P3: Zipformer backend độc lập với terminology](p3-zipformer-asr-backend.md)
 - [P3 implementation report](p3-zipformer-implementation-report.md)
 - [P4–P5: Streaming safety và TTS spoken form](p3-p4-streaming-tts.md)
+- [P4 implementation report](p4-implementation-report.md)
+- [P5 implementation report](p5-implementation-report.md)
+- [P6 implementation report](p6-implementation-report.md)
 - [P6–P8: ASR terminology, lifecycle và observability](p5-p7-asr-operations.md)
 - [P7 chi tiết: Zipformer terminology/hotwords](p6-sherpa-onnx-asr-backend.md)
+- [P7 implementation report](p7-implementation-report.md)
+- [P8 implementation report](p8-implementation-report.md)
 
 ## Thứ tự thực hiện khuyến nghị
 
@@ -66,8 +71,9 @@ P0 -> P1 -> P2 -> P3 (Zipformer backend, no terminology)
 ```
 
 P2 là mốc MVP đầu tiên có giá trị sử dụng. P3 thêm backend/canary độc lập cho cả
-vi/en/zh/ko, không switch toàn bộ ASR và không consume terminology profile. P7 mới
-đánh giá hotwords. P9 không thuộc phạm vi prototype.
+vi/en/zh/ko, không switch toàn bộ ASR. P7 đã nối terminology profile vào native
+hotwords của Sherpa mà không thay đổi backend mặc định. P9 không thuộc phạm vi
+prototype.
 
 ## Definition of Done toàn chương trình
 

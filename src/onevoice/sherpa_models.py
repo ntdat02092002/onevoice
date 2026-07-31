@@ -21,6 +21,11 @@ class SherpaStreamingModelSpec:
     decoder: str
     joiner: str
     tokens: str = "tokens.txt"
+    modeling_unit: str = "bpe"
+    bpe_model: str | None = "bpe.model"
+    bpe_model_url: str | None = None
+    bpe_vocab: str | None = "bpe.vocab"
+    hotword_case: str = "preserve"
     archive: str | None = None
     remote_files: tuple[tuple[str, str], ...] = ()
     chunk_size: int | None = None
@@ -59,6 +64,8 @@ VI_STREAMING_ZIPFORMER = SherpaStreamingModelSpec(
         ),
         ("tokens.txt", f"{_VI_HF_BASE}/config.json"),
     ),
+    bpe_model_url=f"{_VI_HF_BASE}/bpe.model",
+    hotword_case="upper",
     chunk_size=32,
     left_context=128,
     license="cc-by-nc-nd-4.0",
@@ -76,6 +83,7 @@ EN_STREAMING_ZIPFORMER = SherpaStreamingModelSpec(
     encoder="encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
     decoder="decoder-epoch-99-avg-1-chunk-16-left-128.onnx",
     joiner="joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
+    hotword_case="upper",
     chunk_size=16,
     left_context=128,
     source_url=(
@@ -92,6 +100,9 @@ ZH_STREAMING_ZIPFORMER = SherpaStreamingModelSpec(
     encoder="encoder.int8.onnx",
     decoder="decoder.onnx",
     joiner="joiner.int8.onnx",
+    modeling_unit="cjkchar",
+    bpe_model=None,
+    bpe_vocab=None,
     source_url=(
         "https://k2-fsa.github.io/sherpa/onnx/pretrained_models/"
         "online-transducer/zipformer-transducer-models.html"

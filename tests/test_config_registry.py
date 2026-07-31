@@ -17,6 +17,7 @@ def test_default_config() -> None:
     assert config.translation.compute_type == "int8"
     assert config.commit.agreement_updates == 2
     assert config.commit.hold_tokens == 1
+    assert config.commit.term_prefix_timeout_ms == 1500
     assert config.translation.wait_tokens == 6
     assert config.translation.update_tokens == 4
     assert config.translation.timeout_ms == 1200
@@ -32,10 +33,19 @@ def test_default_config() -> None:
     assert config.terminology.matching.normalization == "unicode_nfc"
     assert config.terminology.matching.longest_match_first
     assert config.terminology.matching.case_sensitive_for_codes
+    assert config.terminology.asr.initial_prompt_enabled
+    assert config.terminology.asr.post_correction_enabled
+    assert config.terminology.asr.native_hotwords_enabled
+    assert config.terminology.asr.max_prompt_terms == 32
+    assert config.terminology.asr.max_prompt_tokens == 128
+    assert config.terminology.asr.max_hotword_terms == 64
+    assert config.terminology.asr.max_hotword_tokens == 256
+    assert config.terminology.asr.hotword_score == 1.5
     assert config.terminology.mt.strategy == "placeholder_with_validation"
     assert len(config.terminology.mt.placeholder_formats) == 3
     assert config.terminology.mt.validate_coverage
     assert config.terminology.mt.pivot_canonicalization
+    assert config.terminology.tts.strategy == "spoken_form"
 
 
 def test_registry_reports_available_backends() -> None:
@@ -59,6 +69,12 @@ def test_registry_reports_available_backends() -> None:
         (lambda config: setattr(config.audio, "queue_seconds", 0), "queue_seconds"),
         (lambda config: setattr(config.commit, "agreement_updates", 0), "agreement_updates"),
         (lambda config: setattr(config.commit, "hold_tokens", -1), "hold_tokens"),
+        (
+            lambda config: setattr(
+                config.commit, "term_prefix_timeout_ms", -1
+            ),
+            "term_prefix_timeout_ms",
+        ),
         (lambda config: setattr(config.translation, "wait_tokens", 0), "wait/update"),
         (lambda config: setattr(config.translation, "update_tokens", 0), "wait/update"),
         (lambda config: setattr(config.translation, "timeout_ms", 0), "timing"),
@@ -85,6 +101,42 @@ def test_registry_reports_available_backends() -> None:
                 config.terminology.mt, "placeholder_formats", []
             ),
             "placeholder_formats",
+        ),
+        (
+            lambda config: setattr(
+                config.terminology.tts, "strategy", "unknown"
+            ),
+            "terminology.tts.strategy",
+        ),
+        (
+            lambda config: setattr(
+                config.terminology.asr, "max_prompt_terms", 0
+            ),
+            "max_prompt_terms",
+        ),
+        (
+            lambda config: setattr(
+                config.terminology.asr, "max_prompt_tokens", 0
+            ),
+            "max_prompt_tokens",
+        ),
+        (
+            lambda config: setattr(
+                config.terminology.asr, "max_hotword_terms", 0
+            ),
+            "max_hotword_terms",
+        ),
+        (
+            lambda config: setattr(
+                config.terminology.asr, "max_hotword_tokens", 0
+            ),
+            "max_hotword_tokens",
+        ),
+        (
+            lambda config: setattr(
+                config.terminology.asr, "hotword_score", 0
+            ),
+            "hotword_score",
         ),
     ],
 )

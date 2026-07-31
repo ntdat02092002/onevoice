@@ -1,4 +1,6 @@
 from time import monotonic
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -7,6 +9,8 @@ from onevoice.backends.tts import AUTO_TTS_VOICES, FakeTtsBackend, SherpaOnnxTts
 from onevoice.config import TtsConfig
 from onevoice.models import TranslationUpdate, TtsRequest
 from onevoice.policy import PhraseTtsPolicy
+from onevoice.terminology import TerminologyManager
+from onevoice.terminology.runtime import TerminologyTtsNormalizer
 from onevoice.text import tokenize_text
 
 
@@ -22,6 +26,29 @@ def translation(
         is_final=final,
         started_at=monotonic(),
     )
+
+
+SAMPLE_BUNDLE = Path(
+    "assets/terminology/factory-sample-v1/terminology.yaml"
+)
+
+
+def terminology_tts_policy(
+    *,
+    min_tokens: int,
+    max_tokens: int,
+) -> PhraseTtsPolicy:
+    policy = PhraseTtsPolicy(
+        TtsConfig(
+            min_chunk_tokens=min_tokens,
+            max_chunk_tokens=max_tokens,
+        )
+    )
+    policy.configure_terminology(
+        TerminologyManager.from_path(SAMPLE_BUNDLE),
+        domain="factory-safety",
+    )
+    return policy
 
 
 def test_phrase_policy_waits_for_agreement_and_never_replays_prefix() -> None:
@@ -115,6 +142,140 @@ def test_tts_chunker_short_sentence_long_sentence_and_comma_fallback() -> None:
     assert requests[0].text == "Short complete sentence."
     assert all(len(tokenize_text(request.text, "en")) <= 24 for request in requests)
     assert requests[1].text.endswith(",")
+
+
+def test_term_aware_tts_chunker_moves_boundary_before_whole_term() -> None:
+    policy = terminology_tts_policy(min_tokens=2, max_tokens=4)
+
+    requests = policy.requests_for(
+        translation(
+            "one two emergency stop button now",
+            1,
+            final=True,
+        )
+    )
+
+    assert [request.text for request in requests] == [
+        "one two",
+        "emergency stop button now",
+    ]
+    assert policy.take_metrics()["tts_term_boundary_shifts"] == 1
+
+
+def test_term_longer_than_hard_max_is_emitted_as_exceptional_chunk() -> None:
+    policy = terminology_tts_policy(min_tokens=1, max_tokens=2)
+
+    requests = policy.requests_for(
+        translation("emergency stop button now", 1, final=True)
+    )
+
+    assert [request.text for request in requests] == [
+        "emergency stop button",
+        "now",
+    ]
+    metrics = policy.take_metrics()
+    assert metrics["tts_term_boundary_shifts"] == 1
+    assert metrics["tts_oversized_protected_spans"] == 1
+
+
+def test_tts_normalizer_replaces_display_terms_and_preserves_missing_form() -> None:
+    manager = TerminologyManager.from_path(SAMPLE_BUNDLE)
+    profile = manager.activate(
+        domain="factory-maintenance",
+        source_language="vi",
+        target_language="vi",
+    )
+    normalizer = TerminologyTtsNormalizer(profile)
+    display = "Kiểm tra M5Stack, PLC S7-1200 và EtherCAT."
+
+    result = normalizer.normalize(display)
+
+    assert result.display_text == display
+    assert result.spoken_text == (
+        "Kiểm tra em năm stack, pi eo xi ét bảy một hai không không "
+        "và EtherCAT."
+    )
+    assert result.substitutions == 2
+
+
+@pytest.mark.parametrize(
+    ("language", "display", "spoken"),
+    [
+        ("en", "Use M5Stack.", "Use M five stack."),
+        ("zh", "使用 M5Stack。", "使用 M 五 Stack。"),
+        ("ko", "M5Stack 사용.", "엠 파이브 스택 사용."),
+    ],
+)
+def test_tts_normalizer_preserves_locale_spacing(
+    language: str,
+    display: str,
+    spoken: str,
+) -> None:
+    profile = TerminologyManager.from_path(SAMPLE_BUNDLE).activate(
+        domain="factory-maintenance",
+        source_language=language,
+        target_language=language,
+    )
+
+    assert TerminologyTtsNormalizer(profile).normalize(
+        display
+    ).spoken_text == spoken
+
+
+def test_phrase_request_separates_display_and_spoken_text() -> None:
+    policy = PhraseTtsPolicy(TtsConfig(min_chunk_tokens=1))
+    policy.configure_terminology(
+        TerminologyManager.from_path(SAMPLE_BUNDLE),
+        domain="factory-maintenance",
+    )
+
+    request = policy.requests_for(
+        translation(
+            "Kiểm tra M5Stack.",
+            1,
+            final=True,
+            target="vi",
+        )
+    )[0]
+
+    assert request.text == "Kiểm tra M5Stack."
+    assert request.spoken_text == "Kiểm tra em năm stack."
+    assert request.synthesis_text == request.spoken_text
+    metrics = policy.take_metrics()
+    assert metrics["tts_spoken_form_requests"] == 1
+    assert metrics["tts_spoken_form_substitutions"] == 1
+
+
+def test_term_without_spoken_form_falls_back_to_display_text() -> None:
+    policy = PhraseTtsPolicy(TtsConfig(min_chunk_tokens=1))
+    policy.configure_terminology(
+        TerminologyManager.from_path(SAMPLE_BUNDLE),
+        domain="factory-maintenance",
+    )
+
+    request = policy.requests_for(
+        translation("EtherCAT.", 1, final=True, target="vi")
+    )[0]
+
+    assert request.spoken_text is None
+    assert request.synthesis_text == "EtherCAT."
+
+
+def test_sample_profile_exposes_spoken_forms_for_app_testing() -> None:
+    profile = TerminologyManager.from_path(SAMPLE_BUNDLE).activate(
+        domain="test",
+        source_language="vi",
+        target_language="vi",
+    )
+    result = TerminologyTtsNormalizer(profile).normalize(
+        "windsurfing tại Outdoor Life."
+    )
+
+    assert result.display_text == "windsurfing tại Outdoor Life."
+    assert result.spoken_text == (
+        "lướt ván buồm tại ao đờ lai-ph."
+    )
+    assert result.substitutions == 2
 
 
 def test_cancel_later_final_phrase_does_not_orphan_earlier_reservation() -> None:
@@ -257,6 +418,65 @@ def test_fake_tts_contract_and_lifecycle() -> None:
     assert output.duration_seconds > 0
     backend.reset()
     backend.close()
+
+
+def test_fake_tts_synthesizes_spoken_text_but_reports_display_text() -> None:
+    backend = FakeTtsBackend(TtsConfig(backend="fake"))
+    request = TtsRequest(
+        "M5Stack",
+        "vi",
+        1,
+        True,
+        spoken_text="em năm stack",
+    )
+
+    output = backend.synthesize(request)
+
+    assert output.text == "M5Stack"
+    assert output.spoken_text == "em năm stack"
+
+
+def test_sherpa_tts_passes_spoken_text_to_native_generator(
+    monkeypatch,
+) -> None:
+    seen: list[str] = []
+
+    class GenerationConfig:
+        def __init__(self) -> None:
+            self.sid = 0
+            self.speed = 1.0
+            self.num_steps = 0
+            self.extra = {}
+
+    class NativeTts:
+        def generate(self, text, generation):
+            seen.append(text)
+            return SimpleNamespace(
+                samples=np.ones(160, dtype=np.float32),
+                sample_rate=16_000,
+            )
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "sherpa_onnx",
+        SimpleNamespace(GenerationConfig=GenerationConfig),
+    )
+    backend = SherpaOnnxTtsBackend(TtsConfig(language="vi"))
+    backend._tts = NativeTts()
+
+    output = backend.synthesize(
+        TtsRequest(
+            "M5Stack",
+            "vi",
+            1,
+            True,
+            spoken_text="em năm stack",
+        )
+    )
+
+    assert seen == ["em năm stack"]
+    assert output.text == "M5Stack"
+    assert output.spoken_text == "em năm stack"
 
 
 def test_sherpa_backend_fails_before_import_when_assets_are_missing(tmp_path) -> None:

@@ -1,10 +1,10 @@
-# P5–P7 — ASR Capability, Lifecycle và Operations
+# P6–P9 — ASR Capability, Lifecycle và Operations
 
-Trạng thái: **Planned — chưa implement**
+Trạng thái: **P6–P8 Done; P9 Deferred**
 
 Phụ thuộc: P1. Nên thực hiện sau khi P2–P4 đã có baseline.
 
-## P5 — ASR terminology cho backend hiện tại
+## P6 — ASR terminology cho backend hiện tại
 
 ### Hiện trạng
 
@@ -61,16 +61,19 @@ Profile compiler chỉ sinh artifact mà backend đã công bố hỗ trợ.
 - Post-correction count và rejection count.
 - ASR latency delta.
 
-### P5 exit criteria
+### P6 exit criteria
 
 - Backend không hỗ trợ vẫn chạy bình thường.
 - Prompt/correction không bật ngoài active domain.
 - Có positive và near-acoustic negative benchmark.
 - Không tuyên bố hard guarantee cho prompt-based ASR.
 
-## P6 — Đánh giá chuyển sang sherpa-onnx Zipformer
+## P7 — Zipformer terminology/hotwords
 
 Plan implementation chi tiết: [Backend sherpa-onnx ASR cho Zipformer/Gipformer tiếng Việt](p6-sherpa-onnx-asr-backend.md).
+
+Trạng thái triển khai: **Done**. Kết quả và giới hạn benchmark được ghi tại
+[P7 implementation report](p7-implementation-report.md).
 
 ### Kết luận kiến trúc ban đầu
 
@@ -107,7 +110,7 @@ Lý do:
 Model ID, license, model size, tokenizer và checksum phải được pin trong
 `MODEL_ZOO.md`; không dùng tên chung `zipformer-auto`.
 
-### P6.0 — Benchmark spike, chưa tích hợp pipeline
+### P7.0 — Benchmark spike
 
 So sánh trên cùng corpus:
 
@@ -142,7 +145,7 @@ Metrics:
 
 Không dùng RTF từ model documentation làm acceptance result cho thiết bị đích.
 
-### P6.1 — Backend canary
+### P7.1 — Backend canary
 
 Thêm adapter qua registry, không hard-code vào pipeline:
 
@@ -172,7 +175,7 @@ Adapter online phải:
 - không để sherpa endpoint tự ý cạnh tranh với VAD/semantic endpoint của pipeline
   trong phase đầu.
 
-### P6.2 — Hotword artifact và per-stream activation
+### P7.2 — Hotword artifact và per-stream activation
 
 - Compile canonical/alias term theo tokenizer/modeling unit.
 - Validate `tokens.txt` và `bpe.vocab` checksum.
@@ -184,7 +187,7 @@ Adapter online phải:
 
 Không dùng một global hotword score cho mọi model/ngôn ngữ.
 
-### P6.3 — Vietnamese decision
+### P7.3 — Vietnamese decision
 
 Không đưa Vietnamese offline Zipformer vào realtime primary path chỉ để có
 hotwords.
@@ -217,29 +220,39 @@ Cho phép Zipformer trở thành default của một ngôn ngữ khi:
 Nếu chỉ hotword metric tốt nhưng general ASR hoặc latency kém, giữ Zipformer dưới
 dạng optional domain profile thay vì default.
 
-### Không thuộc P6
+### Không thuộc P7
 
 - Keyword spotting thay full ASR.
 - Mid-utterance hotword swap.
 - Switch cả bốn ngôn ngữ trong một release.
 - Tự động download một model không được pin/checksum.
 
-### P6 exit criteria
+### P7 implementation exit criteria
 
-- Có benchmark report theo từng language/device.
-- `sherpa_zipformer` là adapter tùy chọn và không ảnh hưởng backend hiện tại.
-- Native hotword artifact tương thích model.
-- Term recall/precision và false insertion được đo với/không hotwords.
+- [x] `sherpa_onnx` là adapter tùy chọn và không ảnh hưởng backend hiện tại.
+- [x] Native hotword artifact tương thích model/tokenizer.
+- [x] Có A/B canary với/không hotwords và smoke test vi/en/zh/ko.
+- [x] Existing test suite không regression.
+
+### Production rollout gate
+
+- Benchmark term recall/precision, false insertion, WER/CER và latency trên corpus
+  đủ lớn cho từng language/device.
 - Chỉ những language vượt go/no-go gate mới được enable ngoài canary.
 
-## P7 — Bundle lifecycle và compatibility
+## P8 — Bundle lifecycle và compatibility
+
+Trạng thái triển khai: **Done (simplified lifecycle)**. Theo quyết định sản phẩm,
+không hot-swap hoặc rollback bundle trong pipeline đang chạy. Muốn đổi bundle,
+domain hoặc route phải stop pipeline, đổi cấu hình rồi start lại. Chi tiết:
+[P8 implementation report](p8-implementation-report.md).
 
 ### Activation
 
-- Load/validate bundle trước khi inference.
-- Tạo immutable profile cho session/domain/language route.
-- Một utterance chỉ dùng một profile version.
-- Swap request giữa utterance được áp dụng ở utterance kế tiếp.
+- Load/validate/compile bundle trước khi model inference.
+- Tạo immutable build/profile cho toàn bộ pipeline session.
+- Khóa bundle/domain/language route khi pipeline đang chạy.
+- Muốn đổi phải stop và start một pipeline mới.
 
 ### Compatibility manifest
 
@@ -266,12 +279,10 @@ Checksum chỉ bắt buộc với artifact phụ thuộc model. Spoken-form text
 
 ### Rollback
 
-- Giữ profile/bundle trước gần nhất.
-- Activation mới chỉ publish sau khi toàn bộ validation pass.
-- Failure không làm mất active profile.
-- Rollback cũng áp dụng tại utterance boundary.
+Không có in-process rollback trong bản đơn giản. Nếu bundle mới không qua
+preflight thì pipeline mới không start; người dùng chọn lại bundle cũ rồi start.
 
-## P7 — Config, CLI và Streamlit
+## P8 — Config, CLI và Streamlit
 
 ### Config
 
@@ -280,7 +291,6 @@ terminology:
   enabled: false
   bundle_path: null
   domain: null
-  apply_at: utterance_boundary
   mt:
     strategy: placeholder_with_validation
     validate_coverage: true
@@ -301,11 +311,11 @@ terminology:
 
 ### Streamlit
 
-- Bundle/domain selector bị khóa khi utterance đang chạy.
-- Hiển thị active bundle ID/profile.
+- Bundle/domain và pipeline selector bị khóa trong toàn thời gian pipeline chạy.
+- Hiển thị active bundle ID/schema/domain/route/checksum và artifact counts.
 - Báo compatibility error trước khi bật microphone/file processing.
 
-## P7 — Observability
+## P8 — Observability
 
 Nhóm metric:
 
@@ -326,27 +336,27 @@ Event lỗi cần phân biệt:
 - MT terminology validation error;
 - ASR capability mismatch.
 
-## P7 test plan
+## P8 test plan
 
-- Invalid bundle không replace active profile.
-- Swap chỉ có hiệu lực ở utterance kế tiếp.
-- Rollback.
-- Concurrent MT job giữ profile version cũ.
+- Invalid bundle không cho start pipeline.
+- Stop/change/start tạo immutable build mới.
+- Pipeline session giữ nguyên build đã compile.
 - Config deep merge.
 - CLI override.
 - Streamlit control locking.
-- Manifest/checksum mismatch.
+- Relative path/checksum/build summary.
 - Disabled mode không yêu cầu bundle.
 
-## P7 exit criteria
+## P8 exit criteria
 
-- Activation atomic.
-- Không có mixed profile trong cùng utterance.
-- Có rollback được kiểm thử.
-- UI/CLI dùng chung config contract.
-- Metrics đủ để xác định lỗi thuộc ASR, commit, MT, chunker hay TTS.
+- [x] Bundle invalid không cho pipeline start.
+- [x] Không có mixed profile trong cùng pipeline session.
+- [x] UI khóa controls khi pipeline đang chạy.
+- [x] UI/CLI dùng chung preflight compiler.
+- [x] Có relative build path, checksum, compiled counts và metrics.
+- [x] Existing test suite không regression.
 
-## P8 — R&D sau prototype
+## P9 — R&D sau prototype
 
 Chỉ mở khi metric cho thấy baseline chưa đạt:
 
@@ -356,9 +366,9 @@ Chỉ mở khi metric cho thấy baseline chưa đạt:
 - vector glossary retrieval;
 - custom phoneme lexicon/direct phoneme IDs.
 
-Mỗi hướng P8 cần ADR và benchmark riêng; không thêm dependency vào prototype mặc định.
+Mỗi hướng P9 cần ADR và benchmark riêng; không thêm dependency vào prototype mặc định.
 
-## Tài liệu kỹ thuật dùng cho quyết định P6
+## Tài liệu kỹ thuật dùng cho quyết định P7
 
 - [sherpa-onnx Hotwords / Contextual biasing](https://k2-fsa.github.io/sherpa/onnx/hotwords/index.html)
 - [Online Transducer model catalog](https://k2-fsa.github.io/sherpa/onnx/pretrained_models/online-transducer/index.html)

@@ -37,6 +37,7 @@ commit:
   backend: local_agreement
   agreement_updates: 2
   hold_tokens: 1
+  term_prefix_timeout_ms: 1500
 translation:
   backend: opus_ct2
   model: opus-auto
@@ -87,6 +88,15 @@ terminology:
     normalization: unicode_nfc
     longest_match_first: true
     case_sensitive_for_codes: true
+  asr:
+    initial_prompt_enabled: true
+    post_correction_enabled: true
+    native_hotwords_enabled: true
+    max_prompt_terms: 32
+    max_prompt_tokens: 128
+    max_hotword_terms: 64
+    max_hotword_tokens: 256
+    hotword_score: 1.5
   mt:
     strategy: placeholder_with_validation
     placeholder_formats:
@@ -97,3 +107,5 @@ terminology:
     pivot_canonicalization: true
     validate_order: false
     on_validation_error: segment_fallback
+  tts:
+    strategy: spoken_form

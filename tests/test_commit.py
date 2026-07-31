@@ -1,9 +1,36 @@
 from time import monotonic
+from pathlib import Path
 
 from onevoice.backends.commit import LocalAgreementCommitter
 from onevoice.config import CommitConfig
 from onevoice.models import AsrUpdate
+from onevoice.terminology import TerminologyManager
 from onevoice.text import tokenize_text
+
+
+SAMPLE_BUNDLE = Path(
+    "assets/terminology/factory-sample-v1/terminology.yaml"
+)
+
+
+def terminology_committer(
+    *,
+    language: str = "en",
+    domain: str = "factory-safety",
+    timeout_ms: int = 1_500,
+) -> LocalAgreementCommitter:
+    committer = LocalAgreementCommitter(
+        CommitConfig(
+            agreement_updates=1,
+            hold_tokens=0,
+            term_prefix_timeout_ms=timeout_ms,
+        )
+    )
+    committer.configure_terminology(
+        TerminologyManager.from_path(SAMPLE_BUNDLE),
+        domain=domain,
+    )
+    return committer
 
 
 def update(
@@ -116,4 +143,59 @@ def test_timestamped_endpoint_final_discards_mutable_tail() -> None:
     )
 
     assert final.is_final
+    assert final.text == "One."
+
+
+def test_term_aware_committer_holds_open_prefix_until_term_completes() -> None:
+    committer = terminology_committer()
+
+    first = committer.update(update("press emergency", 1))
+    assert first is not None
+    assert first.text == "press"
+    assert committer.update(update("press emergency stop", 2)) is None
+
+    completed = committer.update(
+        update("press emergency stop button now", 3)
+    )
+    assert completed is not None
+    assert completed.text == "press emergency stop button now"
+    assert committer.take_metrics()["term_prefix_hold_events"] == 2
+
+
+def test_term_aware_committer_releases_cancelled_prefix_and_final_flushes() -> None:
+    committer = terminology_committer()
+    assert committer.update(update("press emergency", 1)).text == "press"
+
+    cancelled = committer.update(update("press another control", 2))
+    assert cancelled is not None
+    assert cancelled.text == "press another control"
+
+    committer.reset()
+    final = committer.update(update("press emergency", 3, final=True))
+    assert final is not None
+    assert final.text == "press emergency"
+
+
+def test_term_prefix_timeout_can_release_open_suffix() -> None:
+    committer = terminology_committer(timeout_ms=0)
+
+    released = committer.update(update("press emergency", 1))
+
+    assert released is not None
+    assert released.text == "press emergency"
+    metrics = committer.take_metrics()
+    assert metrics["term_prefix_timeout_flushes"] == 1
+
+
+def test_semantic_endpoint_does_not_flush_held_term_prefix() -> None:
+    committer = terminology_committer()
+    partial = committer.update(update("One. press emergency", 1))
+    assert partial is not None
+    assert partial.text == "One. press"
+
+    final = committer.update(
+        update("One.", 2, final=True, endpoint_cut=True)
+    )
+
+    assert final is not None
     assert final.text == "One."

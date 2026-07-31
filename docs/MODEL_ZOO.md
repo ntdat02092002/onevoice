@@ -82,6 +82,13 @@ Ngôn ngữ sản phẩm:
 - Có thể tắt punctuator English bằng
   `asr.sherpa.punctuation_enabled: false`; khi đó semantic endpoint theo dấu câu
   không có boundary đáng tin cậy cho model English này.
+- Khi terminology được bật, backend dùng native hotwords theo từng Sherpa stream.
+  Pipeline tự chuyển `greedy_search` sang `modified_beam_search`, vì Sherpa chỉ
+  hỗ trợ contextual bias cho Transducer ở decoding mode này.
+- Profile được giới hạn bằng `max_hotword_terms` và `max_hotword_tokens`. BPE
+  model dùng `bpe.model`/`bpe.vocab`; Chinese dùng `cjkchar`. Term không biểu diễn
+  được bằng tokenizer bị loại và được đếm trong
+  `asr_hotword_rejection_count`; exact-alias post-correction vẫn là fallback.
 
 ## Machine Translation
 

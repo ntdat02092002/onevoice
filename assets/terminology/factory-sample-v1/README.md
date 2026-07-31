@@ -11,6 +11,10 @@ Domain `test` có hai term kiểm thử MT preserve:
 - `windsurfing`, kèm alias `wind surfing` và lỗi ASR/typing `winssurfing`;
 - tên riêng `Outdoor Life`.
 
+Khi target là tiếng Việt, subtitle vẫn giữ hai canonical form trên nhưng TTS
+đọc lần lượt là `lướt ván buồm` và `ao đờ lai-ph`. Với target tiếng Anh,
+`windsurfing` được synthesize thành `wind surfing`.
+
 ## Cách thêm term
 
 Mỗi concept cần:

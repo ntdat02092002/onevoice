@@ -5,6 +5,7 @@ import tarfile
 import tempfile
 import threading
 import urllib.request
+from collections import Counter
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -27,6 +28,7 @@ _DOWNLOAD_LOCK = threading.Lock()
 
 class SherpaOnnxZipformerAsrBackend:
     """True-streaming Zipformer adapter for Vietnamese, English, Chinese and Korean."""
+    terminology_capability = "native_hotwords"
 
     def __init__(self, config: AsrConfig) -> None:
         self.config = config
@@ -38,6 +40,35 @@ class SherpaOnnxZipformerAsrBackend:
         self._processed_samples = 0
         self._segment_started_at: float | None = None
         self._revision = 0
+        self._hotwords = ""
+        self._configured_hotwords: tuple[Any, ...] = ()
+        self._hotword_score = 1.5
+        self._metrics: Counter[str] = Counter()
+
+    def configure_native_hotwords(
+        self,
+        hotwords: tuple[Any, ...],
+        *,
+        global_score: float,
+    ) -> None:
+        if hotwords and (
+            self.config.sherpa.decoding_method
+            != "modified_beam_search"
+        ):
+            raise ValueError(
+                "Sherpa native hotwords require "
+                "asr.sherpa.decoding_method=modified_beam_search"
+            )
+        self._configured_hotwords = hotwords
+        self._hotwords = "\n".join(
+            f"{item.text} :{item.score:g}" for item in hotwords
+        )
+        self._hotword_score = global_score
+
+    def take_metrics(self) -> dict[str, int]:
+        output = dict(self._metrics)
+        self._metrics.clear()
+        return output
 
     def _validate_selection(self) -> None:
         if self.config.language not in DEFAULT_SHERPA_STREAMING_MODEL_BY_LANGUAGE:
@@ -73,6 +104,10 @@ class SherpaOnnxZipformerAsrBackend:
             else self.config.model
         )
         return SHERPA_STREAMING_MODELS[model_id]
+
+    @property
+    def native_hotword_text_case(self) -> str:
+        return self.model_spec.hotword_case
 
     @staticmethod
     def _required_paths(
@@ -199,6 +234,101 @@ class SherpaOnnxZipformerAsrBackend:
                 shutil.rmtree(staging, ignore_errors=True)
         return model_dir
 
+    def _ensure_hotword_assets(
+        self, root: Path
+    ) -> tuple[str, str]:
+        spec = self.model_spec
+        if spec.modeling_unit == "cjkchar":
+            return spec.modeling_unit, ""
+        if not spec.bpe_model or not spec.bpe_vocab:
+            raise RuntimeError(
+                f"Model {spec.id!r} does not declare BPE hotword assets"
+            )
+        model_path = root / spec.bpe_model
+        if not model_path.is_file():
+            if self.config.offline or not spec.bpe_model_url:
+                raise FileNotFoundError(
+                    f"Native hotwords for {spec.id!r} require "
+                    f"{model_path.name}; disable offline mode once to "
+                    "download it"
+                )
+            temporary = model_path.with_suffix(".download")
+            urllib.request.urlretrieve(spec.bpe_model_url, temporary)
+            temporary.replace(model_path)
+        vocab_path = root / spec.bpe_vocab
+        if not vocab_path.is_file():
+            try:
+                import sentencepiece as spm
+            except ImportError as exc:
+                raise RuntimeError(
+                    "BPE hotword export requires sentencepiece; install "
+                    "the 'sherpa-asr' extra"
+                ) from exc
+            processor = spm.SentencePieceProcessor(
+                model_file=str(model_path)
+            )
+            content = "".join(
+                f"{processor.id_to_piece(index)}\t"
+                f"{processor.get_score(index)}\n"
+                for index in range(processor.get_piece_size())
+            )
+            temporary = vocab_path.with_suffix(".tmp")
+            temporary.write_text(content, encoding="utf-8")
+            temporary.replace(vocab_path)
+        return spec.modeling_unit, str(vocab_path.resolve())
+
+    def _prepare_hotwords(self, root: Path) -> str:
+        if not self._configured_hotwords:
+            return ""
+        token_values = {
+            line.rsplit(maxsplit=1)[0]
+            for line in (
+                root / self.model_spec.tokens
+            ).read_text(encoding="utf-8").splitlines()
+            if len(line.rsplit(maxsplit=1)) == 2
+        }
+        accepted: list[Any] = []
+        if self.model_spec.modeling_unit == "cjkchar":
+            for item in self._configured_hotwords:
+                units = tuple(
+                    character
+                    for character in item.text
+                    if not character.isspace()
+                )
+                if units and all(unit in token_values for unit in units):
+                    accepted.append(item)
+        else:
+            assert self.model_spec.bpe_model is not None
+            try:
+                import sentencepiece as spm
+            except ImportError as exc:
+                raise RuntimeError(
+                    "BPE hotword validation requires sentencepiece; "
+                    "install the 'sherpa-asr' extra"
+                ) from exc
+            processor = spm.SentencePieceProcessor(
+                model_file=str(root / self.model_spec.bpe_model)
+            )
+            for item in self._configured_hotwords:
+                pieces = tuple(
+                    processor.encode(item.text, out_type=str)
+                )
+                if (
+                    pieces
+                    and "<unk>" not in pieces
+                    and all(piece in token_values for piece in pieces)
+                ):
+                    accepted.append(item)
+        rejected = len(self._configured_hotwords) - len(accepted)
+        self._metrics["asr_hotword_term_count"] = len(accepted)
+        self._metrics["asr_hotword_token_count"] = sum(
+            item.token_count for item in accepted
+        )
+        self._metrics["asr_hotword_rejection_count"] = rejected
+        return "\n".join(
+            f"{item.text} :{item.score:g}" for item in accepted
+        )
+
     def _download_archive(
         self, spec: SherpaStreamingModelSpec, staging: Path
     ) -> None:
@@ -252,6 +382,11 @@ class SherpaOnnxZipformerAsrBackend:
         root = self._resolve_model_dir()
         paths = self._required_paths(root, self.model_spec)
         settings = self.config.sherpa
+        modeling_unit = self.model_spec.modeling_unit
+        bpe_vocab = ""
+        if self._configured_hotwords:
+            modeling_unit, bpe_vocab = self._ensure_hotword_assets(root)
+            self._hotwords = self._prepare_hotwords(root)
         self._recognizer = self._sherpa.OnlineRecognizer.from_transducer(
             tokens=str(paths["tokens"].resolve()),
             encoder=str(paths["encoder"].resolve()),
@@ -263,6 +398,9 @@ class SherpaOnnxZipformerAsrBackend:
             enable_endpoint_detection=False,
             decoding_method=settings.decoding_method,
             max_active_paths=settings.max_active_paths,
+            hotwords_score=self._hotword_score,
+            modeling_unit=modeling_unit,
+            bpe_vocab=bpe_vocab,
             provider=settings.provider,
         )
         if (
@@ -290,7 +428,13 @@ class SherpaOnnxZipformerAsrBackend:
         if self._recognizer is None:
             self.load()
         if self._stream is None:
-            self._stream = self._recognizer.create_stream()
+            self._stream = (
+                self._recognizer.create_stream(self._hotwords)
+                if self._hotwords
+                else self._recognizer.create_stream()
+            )
+            if self._hotwords:
+                self._metrics["asr_hotword_stream_count"] += 1
             self._processed_samples = 0
         return self._stream
 

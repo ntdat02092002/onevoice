@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
+from time import monotonic
 
 from onevoice.config import CommitConfig
 from onevoice.models import AsrUpdate, CommittedTranscript
+from onevoice.terminology import TerminologyManager
+from onevoice.terminology.matcher import TermPrefixTrie
 from onevoice.text import (
     detokenize,
     ends_phrase,
@@ -26,6 +29,27 @@ class LocalAgreementCommitter:
         self._last_hypothesis: tuple[str, ...] = ()
         self._last_emitted: tuple[str, ...] = ()
         self._revision = 0
+        self._terminology_manager: TerminologyManager | None = None
+        self._terminology_domain: str | None = None
+        self._term_tries: dict[str, TermPrefixTrie] = {}
+        self._term_hold_signature: tuple[str, ...] | None = None
+        self._term_hold_started_at: float | None = None
+        self._metrics: Counter[str] = Counter()
+
+    def configure_terminology(
+        self,
+        manager: TerminologyManager,
+        *,
+        domain: str | None,
+    ) -> None:
+        self._terminology_manager = manager
+        self._terminology_domain = domain
+        self._term_tries.clear()
+
+    def take_metrics(self) -> dict[str, int]:
+        output = dict(self._metrics)
+        self._metrics.clear()
+        return output
 
     def load(self) -> None:
         pass
@@ -37,6 +61,7 @@ class LocalAgreementCommitter:
         self._last_hypothesis = ()
         self._last_emitted = ()
         self._revision = 0
+        self._finish_term_hold()
 
     def close(self) -> None:
         self.reset()
@@ -72,6 +97,9 @@ class LocalAgreementCommitter:
         # window before the speaker starts the next sentence.
         if self.config.hold_tokens and not ends_phrase(agreed, language):
             stable = stable[: max(0, len(stable) - self.config.hold_tokens)]
+        stable = self._guard_open_term_prefix(
+            tuple(stable), language, monotonic()
+        )
 
         # One disagreeing hypothesis commonly produces an empty LCP. Keep the
         # previous mutable fragment until N newer hypotheses agree instead of
@@ -85,6 +113,58 @@ class LocalAgreementCommitter:
         if output == self._last_emitted:
             return None
         return self._emit(output, language, is_final=False)
+
+    def _source_trie(self, language: str) -> TermPrefixTrie | None:
+        if self._terminology_manager is None:
+            return None
+        trie = self._term_tries.get(language)
+        if trie is None:
+            profile = self._terminology_manager.activate(
+                domain=self._terminology_domain,
+                source_language=language,
+                target_language=language,
+            )
+            trie = profile.source_trie
+            self._term_tries[language] = trie
+        return trie
+
+    def _guard_open_term_prefix(
+        self,
+        stable: tuple[str, ...],
+        language: str,
+        now: float,
+    ) -> tuple[str, ...]:
+        trie = self._source_trie(language)
+        start = (
+            trie.longest_suffix_open_prefix(stable)
+            if trie is not None and stable
+            else None
+        )
+        if start is None:
+            self._finish_term_hold(now)
+            return stable
+        signature = (language, *(token.casefold() for token in stable[start:]))
+        if signature != self._term_hold_signature:
+            self._finish_term_hold(now)
+            self._term_hold_signature = signature
+            self._term_hold_started_at = now
+            self._metrics["term_prefix_hold_events"] += 1
+        assert self._term_hold_started_at is not None
+        elapsed_ms = (now - self._term_hold_started_at) * 1_000
+        if elapsed_ms >= self.config.term_prefix_timeout_ms:
+            self._finish_term_hold(now)
+            self._metrics["term_prefix_timeout_flushes"] += 1
+            return stable
+        return stable[:start]
+
+    def _finish_term_hold(self, now: float | None = None) -> None:
+        if self._term_hold_started_at is not None:
+            finished = monotonic() if now is None else now
+            self._metrics["term_prefix_hold_ms"] += max(
+                0, round((finished - self._term_hold_started_at) * 1_000)
+            )
+        self._term_hold_signature = None
+        self._term_hold_started_at = None
 
     def _extract_current(self, tokens: tuple[str, ...]) -> tuple[str, ...] | None:
         if not self._locked:

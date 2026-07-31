@@ -5,6 +5,16 @@ from .mt_protector import (
     TerminologyMtProtector,
     TerminologyMtRuntime,
 )
+from .asr_corrector import (
+    AsrCorrectionStats,
+    AsrHotword,
+    TerminologyAsrCorrector,
+    TerminologyAsrRuntime,
+)
+from .tts_normalizer import (
+    TerminologyTtsNormalizer,
+    TtsNormalizationResult,
+)
 
 __all__ = [
     "MtProtectionResult",
@@ -12,4 +22,10 @@ __all__ = [
     "MtTerminologyStats",
     "TerminologyMtProtector",
     "TerminologyMtRuntime",
+    "AsrCorrectionStats",
+    "AsrHotword",
+    "TerminologyAsrCorrector",
+    "TerminologyAsrRuntime",
+    "TerminologyTtsNormalizer",
+    "TtsNormalizationResult",
 ]

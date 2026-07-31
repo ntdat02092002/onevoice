@@ -34,7 +34,13 @@ from .protocols import (
     VadBackend,
 )
 from .registry import registry
-from .terminology import TerminologyCoverageError, TerminologyManager
+from .terminology import (
+    TerminologyBuildInfo,
+    TerminologyCoverageError,
+    TerminologyManager,
+    prepare_terminology_bundle,
+)
+from .terminology.runtime import TerminologyAsrRuntime
 from .text import (
     detokenize,
     ends_phrase,
@@ -88,6 +94,16 @@ class RealtimePipeline:
         tts: TtsBackend | None = None,
     ) -> None:
         self.config = config
+        auto_hotword_beam_switch = bool(
+            config.terminology.enabled
+            and config.terminology.asr.native_hotwords_enabled
+            and config.asr.backend == "sherpa_onnx"
+            and config.asr.sherpa.decoding_method == "greedy_search"
+        )
+        if auto_hotword_beam_switch:
+            config.asr.sherpa.decoding_method = (
+                "modified_beam_search"
+            )
         config.validate()
         if config.vad.semantic_endpoint_context_ms is None:
             config.vad.semantic_endpoint_context_ms = (
@@ -107,14 +123,88 @@ class RealtimePipeline:
             "translation", config.translation.backend, config=config.translation
         )
         self.terminology_manager: TerminologyManager | None = None
+        self.terminology_build: TerminologyBuildInfo | None = None
+        self._asr_terminology: TerminologyAsrRuntime | None = None
         if config.terminology.enabled:
             assert config.terminology.bundle_path is not None
-            self.terminology_manager = TerminologyManager.from_path(
+            route_resolver = getattr(self.translator, "route", None)
+            if not callable(route_resolver):
+                route_resolver = None
+            (
+                self.terminology_manager,
+                self.terminology_build,
+            ) = prepare_terminology_bundle(
                 config.terminology.bundle_path,
+                domain=config.terminology.domain,
+                source_language=config.translation.source_language,
+                target_language=config.translation.target_language,
                 case_sensitive_for_codes=(
                     config.terminology.matching.case_sensitive_for_codes
                 ),
+                route_resolver=route_resolver,
             )
+            self._asr_terminology = TerminologyAsrRuntime(
+                self.terminology_manager,
+                domain=config.terminology.domain,
+            )
+            capability = str(
+                getattr(self.asr, "terminology_capability", "none")
+            )
+            if (
+                config.terminology.asr.initial_prompt_enabled
+                and capability == "initial_prompt"
+                and config.asr.language != "auto"
+            ):
+                configure_prompt = getattr(
+                    self.asr, "configure_terminology_prompt", None
+                )
+                if not callable(configure_prompt):
+                    raise ValueError(
+                        f"ASR backend {type(self.asr).__name__} declares "
+                        "initial_prompt but cannot configure it"
+                    )
+                configure_prompt(
+                    self._asr_terminology.prompt_terms(
+                        config.asr.language,
+                        max_terms=(
+                            config.terminology.asr.max_prompt_terms
+                        ),
+                        max_tokens=(
+                            config.terminology.asr.max_prompt_tokens
+                        ),
+                    )
+                )
+            if (
+                config.terminology.asr.native_hotwords_enabled
+                and capability == "native_hotwords"
+            ):
+                configure_hotwords = getattr(
+                    self.asr, "configure_native_hotwords", None
+                )
+                if not callable(configure_hotwords):
+                    raise ValueError(
+                        f"ASR backend {type(self.asr).__name__} declares "
+                        "native_hotwords but cannot configure them"
+                    )
+                configure_hotwords(
+                    self._asr_terminology.hotwords(
+                        config.asr.language,
+                        max_terms=(
+                            config.terminology.asr.max_hotword_terms
+                        ),
+                        max_tokens=(
+                            config.terminology.asr.max_hotword_tokens
+                        ),
+                        text_case=getattr(
+                            self.asr,
+                            "native_hotword_text_case",
+                            "preserve",
+                        ),
+                    ),
+                    global_score=(
+                        config.terminology.asr.hotword_score
+                    ),
+                )
             configure_terminology = getattr(
                 self.translator, "configure_terminology", None
             )
@@ -127,6 +217,18 @@ class RealtimePipeline:
                 self.terminology_manager,
                 domain=config.terminology.domain,
                 config=config.terminology.mt,
+            )
+            configure_commit_terminology = getattr(
+                self.committer, "configure_terminology", None
+            )
+            if not callable(configure_commit_terminology):
+                raise ValueError(
+                    f"Commit policy {type(self.committer).__name__} does not "
+                    "support terminology safety"
+                )
+            configure_commit_terminology(
+                self.terminology_manager,
+                domain=config.terminology.domain,
             )
         self.tts = tts or registry.create("tts", config.tts.backend, config=config.tts)
         audio_capacity = max(8, config.audio.queue_seconds * 1000 // config.audio.frame_ms)
@@ -149,6 +251,16 @@ class RealtimePipeline:
         self._latest_translation_revisions: dict[tuple[int, int], int] = {}
         self._latest_lock = threading.Lock()
         self._metrics: Counter[str] = Counter()
+        if auto_hotword_beam_switch:
+            self._metrics["asr_hotword_auto_beam_switch"] = 1
+        if self.terminology_build is not None:
+            self._metrics["terminology_build_count"] = 1
+            self._metrics["terminology_profile_count"] = (
+                self.terminology_build.profile_count
+            )
+            self._metrics["terminology_compiled_entry_count"] = (
+                self.terminology_build.entry_count
+            )
         self._metrics_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
         self._started = False
@@ -157,6 +269,11 @@ class RealtimePipeline:
         self._active_utterance_id = 0
         self._translation_policy = WaitKTranslationPolicy(config.translation)
         self._tts_policy = PhraseTtsPolicy(config.tts)
+        if self.terminology_manager is not None:
+            self._tts_policy.configure_terminology(
+                self.terminology_manager,
+                domain=config.terminology.domain,
+            )
 
     @property
     def is_running(self) -> bool:
@@ -169,6 +286,13 @@ class RealtimePipeline:
     def _count_metric(self, name: str, amount: int = 1) -> None:
         with self._metrics_lock:
             self._metrics[name] += amount
+
+    def _collect_component_metrics(self, component: Any) -> None:
+        take_metrics = getattr(component, "take_metrics", None)
+        if not callable(take_metrics):
+            return
+        for name, amount in take_metrics().items():
+            self._count_metric(name, amount)
 
     def start(self, *, load_models: bool = True) -> None:
         if self._started:
@@ -429,6 +553,22 @@ class RealtimePipeline:
                 if language == "auto":
                     language = self.config.translation.source_language
                 update: AsrUpdate = self.asr.transcribe(item.segment, language)
+                self._collect_component_metrics(self.asr)
+                if (
+                    self._asr_terminology is not None
+                    and self.config.terminology.asr.post_correction_enabled
+                ):
+                    update, correction_stats = (
+                        self._asr_terminology.correct(update)
+                    )
+                    self._count_metric(
+                        "asr_post_correction_count",
+                        correction_stats.corrections,
+                    )
+                    self._count_metric(
+                        "asr_post_correction_timing_drops",
+                        correction_stats.timing_drops,
+                    )
                 if item.generation != self._current_generation():
                     continue
                 if update.is_final:
@@ -451,6 +591,7 @@ class RealtimePipeline:
                     metrics={"asr_latency_ms": update.latency_ms},
                 )
                 committed = self.committer.update(update)
+                self._collect_component_metrics(self.committer)
                 if committed is None:
                     continue
                 endpoint_boundary = self._maybe_request_semantic_endpoint(
@@ -758,6 +899,7 @@ class RealtimePipeline:
                             self._tts_policy.cancel(request.phrase_id)
                         else:
                             self._count_metric("tts_requests_enqueued")
+                    self._collect_component_metrics(self._tts_policy)
                 if result.is_final:
                     with self._latest_lock:
                         self._latest_translation_revisions.pop(revision_key, None)
