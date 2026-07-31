@@ -25,6 +25,19 @@ class VadConfig:
     max_utterance_seconds: int = 15
     semantic_endpoint_enabled: bool = True
     semantic_endpoint_sentences: int = 2
+    semantic_endpoint_context_ms: int | None = None
+
+
+@dataclass(slots=True)
+class SherpaAsrConfig:
+    recognizer_mode: str = "online_transducer"
+    provider: str = "cpu"
+    num_threads: int = 2
+    decoding_method: str = "greedy_search"
+    max_active_paths: int = 4
+    final_padding_ms: int = 500
+    cache_dir: str = ".cache/onevoice/asr"
+    punctuation_enabled: bool = True
 
 
 @dataclass(slots=True)
@@ -39,6 +52,7 @@ class AsrConfig:
     update_interval: float = 0.5
     decoding_method: str = "attention"
     offline: bool = False
+    sherpa: SherpaAsrConfig = field(default_factory=SherpaAsrConfig)
 
 
 @dataclass(slots=True)
@@ -46,6 +60,7 @@ class CommitConfig:
     backend: str = "local_agreement"
     agreement_updates: int = 2
     hold_tokens: int = 1
+    term_prefix_timeout_ms: int = 1_500
 
 
 @dataclass(slots=True)
@@ -97,6 +112,63 @@ class TtsConfig:
 
 
 @dataclass(slots=True)
+class TerminologyMatchingConfig:
+    normalization: str = "unicode_nfc"
+    longest_match_first: bool = True
+    case_sensitive_for_codes: bool = True
+
+
+@dataclass(slots=True)
+class TerminologyAsrConfig:
+    initial_prompt_enabled: bool = True
+    post_correction_enabled: bool = True
+    native_hotwords_enabled: bool = True
+    max_prompt_terms: int = 32
+    max_prompt_tokens: int = 128
+    max_hotword_terms: int = 64
+    max_hotword_tokens: int = 256
+    hotword_score: float = 1.5
+
+
+@dataclass(slots=True)
+class TerminologyMtConfig:
+    strategy: str = "placeholder_with_validation"
+    placeholder_formats: list[str] = field(
+        default_factory=lambda: [
+            "__TERM_{id:04d}__",
+            "OVT{id:04d}OVT",
+            "ZXTERM{id:04d}ZX",
+        ]
+    )
+    validate_coverage: bool = True
+    pivot_canonicalization: bool = True
+    validate_order: bool = False
+    on_validation_error: str = "raise"
+
+
+@dataclass(slots=True)
+class TerminologyTtsConfig:
+    strategy: str = "spoken_form"
+
+
+@dataclass(slots=True)
+class TerminologyConfig:
+    enabled: bool = False
+    bundle_path: str | None = None
+    domain: str | None = None
+    matching: TerminologyMatchingConfig = field(
+        default_factory=TerminologyMatchingConfig
+    )
+    asr: TerminologyAsrConfig = field(
+        default_factory=TerminologyAsrConfig
+    )
+    mt: TerminologyMtConfig = field(default_factory=TerminologyMtConfig)
+    tts: TerminologyTtsConfig = field(
+        default_factory=TerminologyTtsConfig
+    )
+
+
+@dataclass(slots=True)
 class PipelineConfig:
     audio: AudioConfig = field(default_factory=AudioConfig)
     vad: VadConfig = field(default_factory=VadConfig)
@@ -104,6 +176,7 @@ class PipelineConfig:
     commit: CommitConfig = field(default_factory=CommitConfig)
     translation: TranslationConfig = field(default_factory=TranslationConfig)
     tts: TtsConfig = field(default_factory=TtsConfig)
+    terminology: TerminologyConfig = field(default_factory=TerminologyConfig)
 
     def validate(self) -> None:
         if self.audio.asr_chunk_ms <= 0:
@@ -123,10 +196,21 @@ class PipelineConfig:
             raise ValueError("VAD max_utterance_seconds must be positive")
         if self.vad.semantic_endpoint_sentences < 1:
             raise ValueError("semantic_endpoint_sentences must be at least 1")
+        if (
+            self.vad.semantic_endpoint_context_ms is not None
+            and self.vad.semantic_endpoint_context_ms < 0
+        ):
+            raise ValueError(
+                "semantic_endpoint_context_ms must be non-negative"
+            )
         if self.commit.agreement_updates < 1:
             raise ValueError("commit.agreement_updates must be at least 1")
         if self.commit.hold_tokens < 0:
             raise ValueError("commit.hold_tokens must be non-negative")
+        if self.commit.term_prefix_timeout_ms < 0:
+            raise ValueError(
+                "commit.term_prefix_timeout_ms must be non-negative"
+            )
         if self.translation.target_language not in ("vi", "en", "zh", "ko"):
             raise ValueError("target language must be vi, en, zh, or ko")
         if self.translation.source_language not in ("auto", "vi", "en", "zh", "ko"):
@@ -135,6 +219,28 @@ class PipelineConfig:
             raise ValueError("ASR language must be auto, vi, en, zh, or ko")
         if self.asr.update_interval <= 0:
             raise ValueError("ASR update_interval must be positive")
+        if self.asr.sherpa.recognizer_mode != "online_transducer":
+            raise ValueError(
+                "asr.sherpa.recognizer_mode must be online_transducer"
+            )
+        if self.asr.sherpa.provider not in ("cpu", "cuda", "coreml"):
+            raise ValueError("asr.sherpa.provider must be cpu, cuda, or coreml")
+        if self.asr.sherpa.num_threads < 1:
+            raise ValueError("asr.sherpa.num_threads must be at least 1")
+        if self.asr.sherpa.decoding_method not in (
+            "greedy_search",
+            "modified_beam_search",
+        ):
+            raise ValueError(
+                "asr.sherpa.decoding_method must be greedy_search or "
+                "modified_beam_search"
+            )
+        if self.asr.sherpa.max_active_paths < 1:
+            raise ValueError("asr.sherpa.max_active_paths must be at least 1")
+        if not 0 <= self.asr.sherpa.final_padding_ms <= 2_000:
+            raise ValueError(
+                "asr.sherpa.final_padding_ms must be between 0 and 2000"
+            )
         if self.translation.wait_tokens < 1 or self.translation.update_tokens < 1:
             raise ValueError("translation wait/update tokens must be at least 1")
         if self.translation.timeout_ms <= 0 or self.translation.min_request_interval_ms <= 0:
@@ -166,6 +272,83 @@ class PipelineConfig:
         if self.tts.emission_mode not in (None, "final_utterance", "stable_sentence", "stable_phrase"):
             raise ValueError(
                 "TTS emission_mode must be final_utterance, stable_sentence, or stable_phrase"
+            )
+        if self.terminology.enabled and not self.terminology.bundle_path:
+            raise ValueError(
+                "terminology.bundle_path is required when terminology is enabled"
+            )
+        if self.terminology.matching.normalization != "unicode_nfc":
+            raise ValueError(
+                "terminology.matching.normalization must be unicode_nfc"
+            )
+        if not self.terminology.matching.longest_match_first:
+            raise ValueError(
+                "terminology.matching.longest_match_first must be true"
+            )
+        if self.terminology.asr.max_prompt_terms < 1:
+            raise ValueError(
+                "terminology.asr.max_prompt_terms must be positive"
+            )
+        if self.terminology.asr.max_prompt_tokens < 1:
+            raise ValueError(
+                "terminology.asr.max_prompt_tokens must be positive"
+            )
+        if self.terminology.asr.max_hotword_terms < 1:
+            raise ValueError(
+                "terminology.asr.max_hotword_terms must be positive"
+            )
+        if self.terminology.asr.max_hotword_tokens < 1:
+            raise ValueError(
+                "terminology.asr.max_hotword_tokens must be positive"
+            )
+        if self.terminology.asr.hotword_score <= 0:
+            raise ValueError(
+                "terminology.asr.hotword_score must be positive"
+            )
+        mt = self.terminology.mt
+        if mt.strategy != "placeholder_with_validation":
+            raise ValueError(
+                "terminology.mt.strategy must be placeholder_with_validation"
+            )
+        if not mt.placeholder_formats:
+            raise ValueError(
+                "terminology.mt.placeholder_formats must not be empty"
+            )
+        rendered: set[str] = set()
+        for index, template in enumerate(mt.placeholder_formats):
+            try:
+                first = template.format(id=1)
+                second = template.format(id=2)
+            except (KeyError, ValueError, IndexError) as exc:
+                raise ValueError(
+                    f"Invalid terminology.mt.placeholder_formats[{index}]: {template!r}"
+                ) from exc
+            if first == second or any(character.isspace() for character in first):
+                raise ValueError(
+                    "terminology.mt placeholder formats must contain a unique id "
+                    "and render without whitespace"
+                )
+            if first in rendered:
+                raise ValueError(
+                    "terminology.mt.placeholder_formats must be unique"
+                )
+            rendered.add(first)
+        if mt.on_validation_error not in ("raise", "segment_fallback"):
+            raise ValueError(
+                "terminology.mt.on_validation_error must be raise or "
+                "segment_fallback"
+            )
+        if self.terminology.enabled and not mt.validate_coverage:
+            raise ValueError(
+                "terminology.mt.validate_coverage must be true when terminology is enabled"
+            )
+        if self.terminology.enabled and not mt.pivot_canonicalization:
+            raise ValueError(
+                "terminology.mt.pivot_canonicalization must be true when terminology is enabled"
+            )
+        if self.terminology.tts.strategy != "spoken_form":
+            raise ValueError(
+                "terminology.tts.strategy must be spoken_form"
             )
 
 
@@ -199,6 +382,42 @@ def _read_yaml_mapping(path: Path) -> dict[str, Any]:
     return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
+def _terminology_from_mapping(
+    values: dict[str, Any] | None,
+) -> TerminologyConfig:
+    data = dict(values or {})
+    matching = _from_mapping(
+        TerminologyMatchingConfig,
+        data.pop("matching", None),
+    )
+    asr = _from_mapping(
+        TerminologyAsrConfig,
+        data.pop("asr", None),
+    )
+    mt = _from_mapping(
+        TerminologyMtConfig,
+        data.pop("mt", None),
+    )
+    tts = _from_mapping(
+        TerminologyTtsConfig,
+        data.pop("tts", None),
+    )
+    config = _from_mapping(TerminologyConfig, data)
+    config.matching = matching
+    config.asr = asr
+    config.mt = mt
+    config.tts = tts
+    return config
+
+
+def _asr_from_mapping(values: dict[str, Any] | None) -> AsrConfig:
+    data = dict(values or {})
+    sherpa = _from_mapping(SherpaAsrConfig, data.pop("sherpa", None))
+    config = _from_mapping(AsrConfig, data)
+    config.sherpa = sherpa
+    return config
+
+
 def load_config(path: str | Path | None = None) -> PipelineConfig:
     default_path = Path("config/default.yaml")
     if path is None:
@@ -217,10 +436,11 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
     config = PipelineConfig(
         audio=_from_mapping(AudioConfig, data.get("audio")),
         vad=_from_mapping(VadConfig, data.get("vad")),
-        asr=_from_mapping(AsrConfig, data.get("asr")),
+        asr=_asr_from_mapping(data.get("asr")),
         commit=_from_mapping(CommitConfig, data.get("commit")),
         translation=_from_mapping(TranslationConfig, data.get("translation")),
         tts=_from_mapping(TtsConfig, data.get("tts")),
+        terminology=_terminology_from_mapping(data.get("terminology")),
     )
     config.validate()
     return config

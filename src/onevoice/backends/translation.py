@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 from typing import Any
 
-from onevoice.config import TranslationConfig
+from onevoice.config import TerminologyMtConfig, TranslationConfig
 from onevoice.models import TranslationRequest, TranslationUpdate
-from onevoice.text import restore_terminal_punctuation, split_sentences
+from onevoice.terminology import TerminologyManager
+from onevoice.terminology.runtime import MtTerminologyStats, TerminologyMtRuntime
+from onevoice.text import (
+    ends_phrase,
+    restore_terminal_punctuation,
+    split_sentences,
+)
 
 
 OPUS_PAIR_MODELS = {
@@ -52,6 +59,74 @@ class _OpusEngine:
     translator: Any
 
 
+@dataclass(frozen=True, slots=True)
+class _CachedSentence:
+    text: str
+    stats: MtTerminologyStats
+
+
+class _SentenceTranslationCache:
+    """Small exact-match cache scoped by pipeline utterance identity."""
+
+    def __init__(self, max_entries: int = 512) -> None:
+        self.max_entries = max_entries
+        self._items: OrderedDict[
+            tuple[tuple[int, int], str, str, str],
+            _CachedSentence,
+        ] = OrderedDict()
+
+    def get(
+        self,
+        stream_id: tuple[int, int] | None,
+        source_language: str,
+        target_language: str,
+        source_sentence: str,
+    ) -> _CachedSentence | None:
+        if stream_id is None:
+            return None
+        key = (
+            stream_id,
+            source_language,
+            target_language,
+            source_sentence,
+        )
+        cached = self._items.get(key)
+        if cached is not None:
+            self._items.move_to_end(key)
+        return cached
+
+    def put(
+        self,
+        stream_id: tuple[int, int] | None,
+        source_language: str,
+        target_language: str,
+        source_sentence: str,
+        value: _CachedSentence,
+    ) -> None:
+        if stream_id is None:
+            return
+        key = (
+            stream_id,
+            source_language,
+            target_language,
+            source_sentence,
+        )
+        self._items[key] = value
+        self._items.move_to_end(key)
+        while len(self._items) > self.max_entries:
+            self._items.popitem(last=False)
+
+    def discard_stream(self, stream_id: tuple[int, int] | None) -> None:
+        if stream_id is None:
+            return
+        for key in tuple(self._items):
+            if key[0] == stream_id:
+                del self._items[key]
+
+    def clear(self) -> None:
+        self._items.clear()
+
+
 class OpusMtCTranslate2Backend:
     """INT8 OPUS-MT routing backend optimized for low-latency CPU inference.
 
@@ -68,6 +143,22 @@ class OpusMtCTranslate2Backend:
         self._snapshot_download: Any = None
         self._converter_type: Any = None
         self._engines: dict[tuple[str, str], _OpusEngine] = {}
+        self._terminology: TerminologyMtRuntime | None = None
+        self._sentence_cache = _SentenceTranslationCache()
+
+    def configure_terminology(
+        self,
+        manager: TerminologyManager,
+        *,
+        domain: str | None,
+        config: TerminologyMtConfig,
+    ) -> None:
+        self._sentence_cache.clear()
+        self._terminology = TerminologyMtRuntime(
+            manager,
+            domain=domain,
+            config=config,
+        )
 
     @staticmethod
     def route(source: str, target: str) -> tuple[tuple[str, str], ...]:
@@ -221,8 +312,7 @@ class OpusMtCTranslate2Backend:
         return engine.tokenizer.decode(target_ids, skip_special_tokens=True).strip()
 
     def reset(self) -> None:
-        # OPUS/Marian translation is stateless between requests.
-        pass
+        self._sentence_cache.clear()
 
     def close(self) -> None:
         for engine in self._engines.values():
@@ -230,30 +320,75 @@ class OpusMtCTranslate2Backend:
             if callable(unload):
                 unload()
         self._engines.clear()
+        self._sentence_cache.clear()
 
     def translate(self, request: TranslationRequest) -> TranslationUpdate:
         route = self._ensure_route(request.source_language, request.target_language)
         started = monotonic()
         translated_sentences: list[str] = []
+        terminology_stats = MtTerminologyStats()
+        sentence_cache_hits = 0
         source_sentences = (
             split_sentences(request.text, request.source_language)
-            if request.is_final
+            if request.is_final or self._terminology is not None
             else (request.text,)
         ) or (request.text,)
-        for source_sentence in source_sentences:
-            text = source_sentence
-            for pair in route:
-                text = self._translate_once(text, pair)
-            translated_sentences.append(
-                restore_terminal_punctuation(
-                    source_sentence,
-                    text,
-                    request.source_language,
-                    request.target_language,
+        try:
+            for source_sentence in source_sentences:
+                is_complete = ends_phrase(
+                    source_sentence, request.source_language
                 )
-                if request.is_final
-                else text
-            )
+                cached = (
+                    self._sentence_cache.get(
+                        request.stream_id,
+                        request.source_language,
+                        request.target_language,
+                        source_sentence,
+                    )
+                    if self._terminology is not None and is_complete
+                    else None
+                )
+                if cached is not None:
+                    translated_sentences.append(cached.text)
+                    terminology_stats += cached.stats
+                    sentence_cache_hits += 1
+                    continue
+
+                text = source_sentence
+                chunk_stats = MtTerminologyStats()
+                for pair in route:
+                    if self._terminology is None:
+                        text = self._translate_once(text, pair)
+                    else:
+                        text, hop_stats = self._terminology.translate_hop(
+                            text,
+                            pair[0],
+                            pair[1],
+                            lambda value, active_pair=pair: self._translate_once(
+                                value, active_pair
+                            ),
+                        )
+                        chunk_stats += hop_stats
+                if request.is_final or is_complete:
+                    text = restore_terminal_punctuation(
+                        source_sentence,
+                        text,
+                        request.source_language,
+                        request.target_language,
+                    )
+                translated_sentences.append(text)
+                terminology_stats += chunk_stats
+                if self._terminology is not None and is_complete:
+                    self._sentence_cache.put(
+                        request.stream_id,
+                        request.source_language,
+                        request.target_language,
+                        source_sentence,
+                        _CachedSentence(text, chunk_stats),
+                    )
+        finally:
+            if request.is_final:
+                self._sentence_cache.discard_stream(request.stream_id)
         separator = "" if request.target_language == "zh" else " "
         text = separator.join(translated_sentences)
         return TranslationUpdate(
@@ -264,6 +399,15 @@ class OpusMtCTranslate2Backend:
             source_revision=request.source_revision,
             is_final=request.is_final,
             started_at=started,
+            terminology_matches=terminology_stats.matches,
+            terminology_hard_matches=terminology_stats.hard_matches,
+            terminology_expected_placeholders=(
+                terminology_stats.expected_placeholders
+            ),
+            terminology_retries=terminology_stats.retries,
+            terminology_fallbacks=terminology_stats.fallbacks,
+            terminology_hops=terminology_stats.hops,
+            sentence_cache_hits=sentence_cache_hits,
         )
 
 
@@ -284,6 +428,22 @@ class M2M100Backend:
         self._snapshot_download: Any = None
         self._converter_type: Any = None
         self._engine: _M2M100Engine | None = None
+        self._terminology: TerminologyMtRuntime | None = None
+        self._sentence_cache = _SentenceTranslationCache()
+
+    def configure_terminology(
+        self,
+        manager: TerminologyManager,
+        *,
+        domain: str | None,
+        config: TerminologyMtConfig,
+    ) -> None:
+        self._sentence_cache.clear()
+        self._terminology = TerminologyMtRuntime(
+            manager,
+            domain=domain,
+            config=config,
+        )
 
     def _import_dependencies(self) -> None:
         if self._ct2 is not None:
@@ -426,7 +586,7 @@ class M2M100Backend:
         return engine.tokenizer.decode(target_ids, skip_special_tokens=True).strip()
 
     def reset(self) -> None:
-        pass
+        self._sentence_cache.clear()
 
     def close(self) -> None:
         if self._engine is not None:
@@ -434,31 +594,77 @@ class M2M100Backend:
             if callable(unload):
                 unload()
         self._engine = None
+        self._sentence_cache.clear()
 
     def translate(self, request: TranslationRequest) -> TranslationUpdate:
         started = monotonic()
         translated_sentences: list[str] = []
+        terminology_stats = MtTerminologyStats()
+        sentence_cache_hits = 0
         source_sentences = (
             split_sentences(request.text, request.source_language)
-            if request.is_final
+            if request.is_final or self._terminology is not None
             else (request.text,)
         ) or (request.text,)
-        for source_sentence in source_sentences:
-            text = self._translate_once(
-                source_sentence,
-                request.source_language,
-                request.target_language,
-            )
-            translated_sentences.append(
-                restore_terminal_punctuation(
-                    source_sentence,
-                    text,
-                    request.source_language,
-                    request.target_language,
+        try:
+            for source_sentence in source_sentences:
+                is_complete = ends_phrase(
+                    source_sentence, request.source_language
                 )
-                if request.is_final
-                else text
-            )
+                cached = (
+                    self._sentence_cache.get(
+                        request.stream_id,
+                        request.source_language,
+                        request.target_language,
+                        source_sentence,
+                    )
+                    if self._terminology is not None and is_complete
+                    else None
+                )
+                if cached is not None:
+                    translated_sentences.append(cached.text)
+                    terminology_stats += cached.stats
+                    sentence_cache_hits += 1
+                    continue
+
+                if self._terminology is None:
+                    text = self._translate_once(
+                        source_sentence,
+                        request.source_language,
+                        request.target_language,
+                    )
+                    chunk_stats = MtTerminologyStats()
+                else:
+                    text, chunk_stats = self._terminology.translate_hop(
+                        source_sentence,
+                        request.source_language,
+                        request.target_language,
+                        lambda value: self._translate_once(
+                            value,
+                            request.source_language,
+                            request.target_language,
+                        ),
+                    )
+                if request.is_final or is_complete:
+                    text = restore_terminal_punctuation(
+                        source_sentence,
+                        text,
+                        request.source_language,
+                        request.target_language,
+                    )
+                translated_sentences.append(text)
+                terminology_stats += chunk_stats
+                if self._terminology is not None and is_complete:
+                    self._sentence_cache.put(
+                        request.stream_id,
+                        request.source_language,
+                        request.target_language,
+                        source_sentence,
+                        _CachedSentence(text, chunk_stats),
+                    )
+        finally:
+            if request.is_final:
+                self._sentence_cache.discard_stream(request.stream_id)
         separator = "" if request.target_language == "zh" else " "
         text = separator.join(translated_sentences)
         return TranslationUpdate(
@@ -469,6 +675,15 @@ class M2M100Backend:
             source_revision=request.source_revision,
             is_final=request.is_final,
             started_at=started,
+            terminology_matches=terminology_stats.matches,
+            terminology_hard_matches=terminology_stats.hard_matches,
+            terminology_expected_placeholders=(
+                terminology_stats.expected_placeholders
+            ),
+            terminology_retries=terminology_stats.retries,
+            terminology_fallbacks=terminology_stats.fallbacks,
+            terminology_hops=terminology_stats.hops,
+            sentence_cache_hits=sentence_cache_hits,
         )
 
 
@@ -476,6 +691,20 @@ class FakeTranslationBackend:
     def __init__(self, config: TranslationConfig) -> None:
         validate_translation_selection(config, "fake")
         self.config = config
+        self._terminology: TerminologyMtRuntime | None = None
+
+    def configure_terminology(
+        self,
+        manager: TerminologyManager,
+        *,
+        domain: str | None,
+        config: TerminologyMtConfig,
+    ) -> None:
+        self._terminology = TerminologyMtRuntime(
+            manager,
+            domain=domain,
+            config=config,
+        )
 
     def load(self) -> None:
         pass
@@ -488,12 +717,28 @@ class FakeTranslationBackend:
 
     def translate(self, request: TranslationRequest) -> TranslationUpdate:
         started = monotonic()
+        stats = MtTerminologyStats()
+        if self._terminology is None:
+            text = f"[{request.target_language}] {request.text}"
+        else:
+            text, stats = self._terminology.translate_hop(
+                request.text,
+                request.source_language,
+                request.target_language,
+                lambda value: f"[{request.target_language}] {value}",
+            )
         return TranslationUpdate(
-            text=f"[{request.target_language}] {request.text}",
+            text=text,
             source_text=request.text,
             source_language=request.source_language,
             target_language=request.target_language,
             source_revision=request.source_revision,
             is_final=request.is_final,
             started_at=started,
+            terminology_matches=stats.matches,
+            terminology_hard_matches=stats.hard_matches,
+            terminology_expected_placeholders=stats.expected_placeholders,
+            terminology_retries=stats.retries,
+            terminology_fallbacks=stats.fallbacks,
+            terminology_hops=stats.hops,
         )

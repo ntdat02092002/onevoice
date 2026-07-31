@@ -11,6 +11,7 @@ from onevoice.config import PipelineConfig
 from onevoice.models import (
     AudioChunk,
     AsrUpdate,
+    AsrWordTiming,
     CommittedTranscript,
     EventType,
     PipelineEvent,
@@ -19,6 +20,7 @@ from onevoice.models import (
     TranslationUpdate,
     TtsUpdate,
 )
+from onevoice.text import tokenize_text
 from onevoice.pipeline import (
     EnqueueResult,
     RealtimePipeline,
@@ -252,6 +254,172 @@ def test_asr_full_queue_replaces_a_partial_but_never_a_final() -> None:
     assert pipeline._enqueue_asr(extra_final) == EnqueueResult.ENQUEUED
     assert list(pipeline._asr_queue.queue) == [*finals, latest, extra_final]
     pipeline._drain_queue(pipeline._asr_queue)
+
+
+class _LifecycleAsr:
+    def __init__(self, *, fail_first: bool = False) -> None:
+        self.fail_first = fail_first
+        self.reset_count = 0
+        self.calls = 0
+
+    def load(self) -> None:
+        pass
+
+    def reset(self) -> None:
+        self.reset_count += 1
+
+    def close(self) -> None:
+        pass
+
+    def transcribe(self, segment, language):
+        self.calls += 1
+        if self.fail_first and self.calls == 1:
+            raise RuntimeError("transient recognizer failure")
+        return AsrUpdate(
+            text="hello",
+            language=language,
+            confidence=1.0,
+            revision=self.calls,
+            is_final=segment.is_final,
+            started_at=time.monotonic(),
+            tokens=("hello",),
+        )
+
+
+def test_asr_worker_resets_backend_between_utterance_ids() -> None:
+    asr = _LifecycleAsr()
+    pipeline = RealtimePipeline(PipelineConfig(), asr=asr)
+    pipeline.start(load_models=False)
+    try:
+        pipeline._asr_queue.put(_asr_job(320, utterance_id=1))
+        assert pipeline.wait_until_idle(timeout=2)
+        pipeline._asr_queue.put(_asr_job(320, utterance_id=2))
+        assert pipeline.wait_until_idle(timeout=2)
+
+        assert asr.calls == 2
+        assert asr.reset_count == 2
+    finally:
+        pipeline.close()
+
+
+def test_asr_worker_recovers_native_state_after_transcribe_error() -> None:
+    asr = _LifecycleAsr(fail_first=True)
+    pipeline = RealtimePipeline(PipelineConfig(), asr=asr)
+    pipeline.start(load_models=False)
+    try:
+        pipeline._asr_queue.put(_asr_job(320))
+        assert pipeline.wait_until_idle(timeout=2)
+        pipeline._asr_queue.put(_asr_job(640))
+        assert pipeline.wait_until_idle(timeout=2)
+
+        events = pipeline.poll_events(100)
+        assert any(
+            event.type == EventType.ERROR
+            and "transient recognizer failure" in event.message
+            for event in events
+        )
+        assert any(event.type == EventType.ASR_PARTIAL for event in events)
+        assert asr.reset_count == 2
+    finally:
+        pipeline.close()
+
+
+class _StrictEndpointAsr:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def load(self) -> None:
+        pass
+
+    def reset(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def transcribe(self, segment, language):
+        self.calls += 1
+        if segment.is_final:
+            # Native final may still decode the onset of the carried suffix.
+            # The pipeline must publish the frozen semantic-prefix text.
+            text = "One. I'm"
+            words = (
+                AsrWordTiming("One", 0.1, 0.3),
+                AsrWordTiming("I'm", 0.31, 0.34),
+            )
+        else:
+            text = "One. Two? unfinished"
+            words = (
+                AsrWordTiming("One", 0.1, 0.3),
+                AsrWordTiming("Two", 0.4, 0.7),
+                AsrWordTiming("unfinished", 0.8, 1.1),
+            )
+        return AsrUpdate(
+            text=text,
+            language=language,
+            confidence=1.0,
+            revision=self.calls,
+            is_final=segment.is_final,
+            started_at=time.monotonic(),
+            tokens=tuple(tokenize_text(text, language)),
+            words=words,
+            is_endpoint_cut=segment.is_endpoint_cut,
+        )
+
+
+def test_strict_semantic_endpoint_clamps_commit_and_freezes_late_partial() -> None:
+    config = PipelineConfig()
+    config.vad.backend = "passthrough"
+    config.vad.semantic_endpoint_sentences = 1
+    config.asr.language = "en"
+    config.translation.backend = "fake"
+    config.translation.model = "fake"
+    config.translation.source_language = "en"
+    config.translation.target_language = "vi"
+    asr = _StrictEndpointAsr()
+    pipeline = RealtimePipeline(config, asr=asr)
+    pipeline.start(load_models=False)
+    try:
+        pipeline._asr_queue.put(_asr_job(16_000))
+        assert pipeline.wait_until_idle(timeout=2)
+        pipeline._asr_queue.put(_asr_job(20_000))
+        assert pipeline.wait_until_idle(timeout=2)
+
+        first_events = pipeline.poll_events(100)
+        partial_commits = [
+            event.payload.text
+            for event in first_events
+            if event.type == EventType.ASR_COMMITTED
+            and not event.payload.is_final
+        ]
+        assert partial_commits == ["One."]
+        assert pipeline._semantic_endpoint_pending.is_set()
+        assert pipeline.vad._endpoint_request.cut_sample == 4_800
+
+        pipeline._asr_queue.put(_asr_job(24_000))
+        assert pipeline.wait_until_idle(timeout=2)
+        assert asr.calls == 2
+
+        final_segment = SpeechSegment(
+            np.zeros(4_800, dtype=np.float32),
+            16_000,
+            started_at=10.0,
+            ended_at=10.3,
+            is_final=True,
+            is_endpoint_cut=True,
+        )
+        pipeline._asr_queue.put(_AsrJob(0, 1, final_segment))
+        assert pipeline.wait_until_idle(timeout=2)
+        final_commits = [
+            event.payload.text
+            for event in pipeline.poll_events(100)
+            if event.type == EventType.ASR_COMMITTED
+            and event.payload.is_final
+        ]
+        assert final_commits == ["One."]
+        assert not pipeline._semantic_endpoint_pending.is_set()
+    finally:
+        pipeline.close()
 
 
 def test_mt_pending_partial_is_latest_only_and_final_supersedes_it() -> None:
@@ -747,6 +915,9 @@ def test_translation_revisions_are_isolated_between_utterances() -> None:
         ]
         assert len(committed_finals) == 2
         assert len(translation_finals) == 2
+        assert {
+            request.stream_id for request in translator.requests
+        } == {(0, 1), (0, 2)}
     finally:
         translator.release.set()
         pipeline.close()

@@ -3,7 +3,7 @@ from __future__ import annotations
 import queue
 import threading
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from math import isfinite
 from time import monotonic
@@ -34,8 +34,15 @@ from .protocols import (
     VadBackend,
 )
 from .registry import registry
+from .terminology import (
+    TerminologyBuildInfo,
+    TerminologyCoverageError,
+    TerminologyManager,
+    prepare_terminology_bundle,
+)
+from .terminology.runtime import TerminologyAsrRuntime
 from .text import (
-    count_complete_sentences,
+    detokenize,
     ends_phrase,
     sentence_token_boundaries,
     tokenize_text,
@@ -87,7 +94,21 @@ class RealtimePipeline:
         tts: TtsBackend | None = None,
     ) -> None:
         self.config = config
+        auto_hotword_beam_switch = bool(
+            config.terminology.enabled
+            and config.terminology.asr.native_hotwords_enabled
+            and config.asr.backend == "sherpa_onnx"
+            and config.asr.sherpa.decoding_method == "greedy_search"
+        )
+        if auto_hotword_beam_switch:
+            config.asr.sherpa.decoding_method = (
+                "modified_beam_search"
+            )
         config.validate()
+        if config.vad.semantic_endpoint_context_ms is None:
+            config.vad.semantic_endpoint_context_ms = (
+                200 if config.asr.backend == "sherpa_onnx" else 0
+            )
         if config.tts.language == "auto":
             config.tts.language = config.translation.target_language
         self.preprocessor = preprocessor or registry.create("preprocessor", "passthrough")
@@ -101,6 +122,114 @@ class RealtimePipeline:
         self.translator = translator or registry.create(
             "translation", config.translation.backend, config=config.translation
         )
+        self.terminology_manager: TerminologyManager | None = None
+        self.terminology_build: TerminologyBuildInfo | None = None
+        self._asr_terminology: TerminologyAsrRuntime | None = None
+        if config.terminology.enabled:
+            assert config.terminology.bundle_path is not None
+            route_resolver = getattr(self.translator, "route", None)
+            if not callable(route_resolver):
+                route_resolver = None
+            (
+                self.terminology_manager,
+                self.terminology_build,
+            ) = prepare_terminology_bundle(
+                config.terminology.bundle_path,
+                domain=config.terminology.domain,
+                source_language=config.translation.source_language,
+                target_language=config.translation.target_language,
+                case_sensitive_for_codes=(
+                    config.terminology.matching.case_sensitive_for_codes
+                ),
+                route_resolver=route_resolver,
+            )
+            self._asr_terminology = TerminologyAsrRuntime(
+                self.terminology_manager,
+                domain=config.terminology.domain,
+            )
+            capability = str(
+                getattr(self.asr, "terminology_capability", "none")
+            )
+            if (
+                config.terminology.asr.initial_prompt_enabled
+                and capability == "initial_prompt"
+                and config.asr.language != "auto"
+            ):
+                configure_prompt = getattr(
+                    self.asr, "configure_terminology_prompt", None
+                )
+                if not callable(configure_prompt):
+                    raise ValueError(
+                        f"ASR backend {type(self.asr).__name__} declares "
+                        "initial_prompt but cannot configure it"
+                    )
+                configure_prompt(
+                    self._asr_terminology.prompt_terms(
+                        config.asr.language,
+                        max_terms=(
+                            config.terminology.asr.max_prompt_terms
+                        ),
+                        max_tokens=(
+                            config.terminology.asr.max_prompt_tokens
+                        ),
+                    )
+                )
+            if (
+                config.terminology.asr.native_hotwords_enabled
+                and capability == "native_hotwords"
+            ):
+                configure_hotwords = getattr(
+                    self.asr, "configure_native_hotwords", None
+                )
+                if not callable(configure_hotwords):
+                    raise ValueError(
+                        f"ASR backend {type(self.asr).__name__} declares "
+                        "native_hotwords but cannot configure them"
+                    )
+                configure_hotwords(
+                    self._asr_terminology.hotwords(
+                        config.asr.language,
+                        max_terms=(
+                            config.terminology.asr.max_hotword_terms
+                        ),
+                        max_tokens=(
+                            config.terminology.asr.max_hotword_tokens
+                        ),
+                        text_case=getattr(
+                            self.asr,
+                            "native_hotword_text_case",
+                            "preserve",
+                        ),
+                    ),
+                    global_score=(
+                        config.terminology.asr.hotword_score
+                    ),
+                )
+            configure_terminology = getattr(
+                self.translator, "configure_terminology", None
+            )
+            if not callable(configure_terminology):
+                raise ValueError(
+                    f"Translation backend {type(self.translator).__name__} "
+                    "does not support terminology"
+                )
+            configure_terminology(
+                self.terminology_manager,
+                domain=config.terminology.domain,
+                config=config.terminology.mt,
+            )
+            configure_commit_terminology = getattr(
+                self.committer, "configure_terminology", None
+            )
+            if not callable(configure_commit_terminology):
+                raise ValueError(
+                    f"Commit policy {type(self.committer).__name__} does not "
+                    "support terminology safety"
+                )
+            configure_commit_terminology(
+                self.terminology_manager,
+                domain=config.terminology.domain,
+            )
         self.tts = tts or registry.create("tts", config.tts.backend, config=config.tts)
         audio_capacity = max(8, config.audio.queue_seconds * 1000 // config.audio.frame_ms)
         self._audio_queue: queue.Queue[Any] = queue.Queue(maxsize=audio_capacity)
@@ -114,11 +243,24 @@ class RealtimePipeline:
         self._stop_event = threading.Event()
         self._reset_audio = threading.Event()
         self._semantic_endpoint_pending = threading.Event()
+        self._semantic_endpoint_final: tuple[tuple[str, ...], str] | None = (
+            None
+        )
         self._generation_lock = threading.Lock()
         self._generation = 0
         self._latest_translation_revisions: dict[tuple[int, int], int] = {}
         self._latest_lock = threading.Lock()
         self._metrics: Counter[str] = Counter()
+        if auto_hotword_beam_switch:
+            self._metrics["asr_hotword_auto_beam_switch"] = 1
+        if self.terminology_build is not None:
+            self._metrics["terminology_build_count"] = 1
+            self._metrics["terminology_profile_count"] = (
+                self.terminology_build.profile_count
+            )
+            self._metrics["terminology_compiled_entry_count"] = (
+                self.terminology_build.entry_count
+            )
         self._metrics_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
         self._started = False
@@ -127,6 +269,11 @@ class RealtimePipeline:
         self._active_utterance_id = 0
         self._translation_policy = WaitKTranslationPolicy(config.translation)
         self._tts_policy = PhraseTtsPolicy(config.tts)
+        if self.terminology_manager is not None:
+            self._tts_policy.configure_terminology(
+                self.terminology_manager,
+                domain=config.terminology.domain,
+            )
 
     @property
     def is_running(self) -> bool:
@@ -139,6 +286,13 @@ class RealtimePipeline:
     def _count_metric(self, name: str, amount: int = 1) -> None:
         with self._metrics_lock:
             self._metrics[name] += amount
+
+    def _collect_component_metrics(self, component: Any) -> None:
+        take_metrics = getattr(component, "take_metrics", None)
+        if not callable(take_metrics):
+            return
+        for name, amount in take_metrics().items():
+            self._count_metric(name, amount)
 
     def start(self, *, load_models: bool = True) -> None:
         if self._started:
@@ -210,6 +364,8 @@ class RealtimePipeline:
         self._threads = []
         self._tts_policy.reset()
         self._translation_policy.reset()
+        self._semantic_endpoint_pending.clear()
+        self._semantic_endpoint_final = None
         self._stop_event.clear()
         self._started = False
 
@@ -280,6 +436,8 @@ class RealtimePipeline:
             backend.close()
         self._translation_policy.reset()
         self._tts_policy.reset()
+        self._semantic_endpoint_pending.clear()
+        self._semantic_endpoint_final = None
         with self._latest_lock:
             self._latest_translation_revisions.clear()
         self._started = False
@@ -304,6 +462,7 @@ class RealtimePipeline:
             self._generation += 1
         self._reset_audio.set()
         self._semantic_endpoint_pending.clear()
+        self._semantic_endpoint_final = None
         with self._latest_lock:
             self._latest_translation_revisions.clear()
         self._drain_queue(self._audio_queue)
@@ -331,6 +490,7 @@ class RealtimePipeline:
                 if self._reset_audio.is_set():
                     self.vad.reset()
                     self._semantic_endpoint_pending.clear()
+                    self._semantic_endpoint_final = None
                     self._speech_active = False
                     self._reset_audio.clear()
                 chunk = self.preprocessor.process(item)
@@ -361,6 +521,7 @@ class RealtimePipeline:
 
     def _asr_worker(self) -> None:
         seen_generation = -1
+        seen_stream_id: tuple[int, int] | None = None
         while not self._stop_event.is_set():
             item = self._asr_queue.get()
             try:
@@ -374,12 +535,55 @@ class RealtimePipeline:
                     self.committer.reset()
                     self._translation_policy.reset()
                     seen_generation = item.generation
+                    seen_stream_id = None
+                stream_id = (item.generation, item.utterance_id)
+                if stream_id != seen_stream_id:
+                    if seen_stream_id is not None:
+                        self.asr.reset()
+                        self.committer.reset()
+                        self._translation_policy.reset()
+                    seen_stream_id = stream_id
+                if (
+                    self._semantic_endpoint_pending.is_set()
+                    and not item.segment.is_final
+                ):
+                    self._count_metric("asr_partials_frozen_at_endpoint")
+                    continue
                 language = self.config.asr.language
                 if language == "auto":
                     language = self.config.translation.source_language
                 update: AsrUpdate = self.asr.transcribe(item.segment, language)
+                self._collect_component_metrics(self.asr)
+                if (
+                    self._asr_terminology is not None
+                    and self.config.terminology.asr.post_correction_enabled
+                ):
+                    update, correction_stats = (
+                        self._asr_terminology.correct(update)
+                    )
+                    self._count_metric(
+                        "asr_post_correction_count",
+                        correction_stats.corrections,
+                    )
+                    self._count_metric(
+                        "asr_post_correction_timing_drops",
+                        correction_stats.timing_drops,
+                    )
                 if item.generation != self._current_generation():
                     continue
+                if update.is_final:
+                    endpoint_final = self._semantic_endpoint_final
+                    if item.segment.is_endpoint_cut and endpoint_final is not None:
+                        endpoint_tokens, endpoint_language = endpoint_final
+                        update = replace(
+                            update,
+                            text=detokenize(
+                                endpoint_tokens, endpoint_language
+                            ),
+                            tokens=endpoint_tokens,
+                        )
+                    self._semantic_endpoint_pending.clear()
+                    self._semantic_endpoint_final = None
                 event_type = EventType.ASR_FINAL if update.is_final else EventType.ASR_PARTIAL
                 self._emit(
                     event_type,
@@ -387,10 +591,28 @@ class RealtimePipeline:
                     metrics={"asr_latency_ms": update.latency_ms},
                 )
                 committed = self.committer.update(update)
-                if update.is_final:
-                    self._semantic_endpoint_pending.clear()
+                self._collect_component_metrics(self.committer)
                 if committed is None:
                     continue
+                endpoint_boundary = self._maybe_request_semantic_endpoint(
+                    committed,
+                    update.text,
+                    item.segment,
+                    update.words,
+                )
+                if endpoint_boundary is not None:
+                    endpoint_tokens = committed.tokens[:endpoint_boundary]
+                    self._semantic_endpoint_final = (
+                        endpoint_tokens,
+                        committed.language,
+                    )
+                    committed = replace(
+                        committed,
+                        text=detokenize(endpoint_tokens, committed.language),
+                        tokens=endpoint_tokens,
+                    )
+                    self.committer.reset()
+                    self._translation_policy.reset()
                 self._emit(
                     EventType.ASR_COMMITTED,
                     payload=committed,
@@ -401,17 +623,12 @@ class RealtimePipeline:
                         )
                     },
                 )
-                self._maybe_request_semantic_endpoint(
-                    committed,
-                    update.text,
-                    item.segment,
-                    update.words,
-                )
                 request = self._translation_policy.request_for(
                     committed, self.config.translation.target_language
                 )
                 if request is not None:
                     revision_key = (item.generation, item.utterance_id)
+                    request = replace(request, stream_id=revision_key)
                     enqueue_started = monotonic()
                     enqueue_result = self._enqueue_translation(
                         _TranslationJob(item.generation, item.utterance_id, request)
@@ -433,6 +650,13 @@ class RealtimePipeline:
                     self._translation_policy.reset()
                     self.asr.reset()
             except Exception as exc:
+                # A native streaming recognizer may have consumed part of the
+                # failed snapshot. Drop that state so the next growing
+                # snapshot can be decoded from its complete audio instead of
+                # repeating the same cursor error forever.
+                self.asr.reset()
+                self._semantic_endpoint_pending.clear()
+                self._semantic_endpoint_final = None
                 self._emit(EventType.ERROR, message=f"ASR error: {exc}")
             finally:
                 self._asr_queue.task_done()
@@ -443,17 +667,19 @@ class RealtimePipeline:
         active_hypothesis: str | None = None,
         segment: SpeechSegment | None = None,
         word_timings: tuple[AsrWordTiming, ...] = (),
-    ) -> None:
+    ) -> int | None:
         config = self.config.vad
         active_text = active_hypothesis or committed.text
+        boundaries = sentence_token_boundaries(
+            committed.text, committed.language
+        )
         if (
             committed.is_final
             or not config.semantic_endpoint_enabled
             or self._semantic_endpoint_pending.is_set()
-            or count_complete_sentences(committed.text, committed.language)
-            < config.semantic_endpoint_sentences
+            or len(boundaries) < config.semantic_endpoint_sentences
         ):
-            return
+            return None
         cut_sample = self._aligned_sentence_cut_sample(
             committed,
             segment,
@@ -464,14 +690,14 @@ class RealtimePipeline:
             not ends_phrase(committed.text, committed.language)
             or not ends_phrase(active_text, committed.language)
         ):
-            return
+            return None
         request_endpoint = getattr(self.vad, "request_endpoint", None)
         if request_endpoint is None:
             self._emit(
                 EventType.ERROR,
                 message="Semantic endpoint is enabled but the VAD backend does not support it",
             )
-            return
+            return None
         self._semantic_endpoint_pending.set()
         try:
             if segment is None:
@@ -484,6 +710,12 @@ class RealtimePipeline:
         except Exception:
             self._semantic_endpoint_pending.clear()
             raise
+        boundary_index = (
+            config.semantic_endpoint_sentences - 1
+            if cut_sample is not None
+            else len(boundaries) - 1
+        )
+        return boundaries[boundary_index]
 
     @staticmethod
     def _aligned_sentence_cut_sample(
@@ -498,10 +730,7 @@ class RealtimePipeline:
         boundaries = sentence_token_boundaries(committed.text, committed.language)
         if len(boundaries) < sentence_count:
             return None
-        # Cut after the latest completed stable sentence, not an earlier
-        # threshold sentence. The committer may already have locked all of
-        # them; cutting earlier would put locked text outside the final audio.
-        target_tokens = committed.tokens[: boundaries[-1]]
+        target_tokens = committed.tokens[: boundaries[sentence_count - 1]]
         target = tuple(
             token.casefold()
             for token in target_tokens
@@ -597,6 +826,27 @@ class RealtimePipeline:
                 )
                 self._count_metric("mt_inference_count")
                 result = self.translator.translate(item.request)
+                self._count_metric(
+                    "terminology_matches", result.terminology_matches
+                )
+                self._count_metric(
+                    "terminology_hard_matches",
+                    result.terminology_hard_matches,
+                )
+                self._count_metric(
+                    "mt_placeholder_expected",
+                    result.terminology_expected_placeholders,
+                )
+                self._count_metric(
+                    "mt_placeholder_retry", result.terminology_retries
+                )
+                self._count_metric(
+                    "mt_terminology_fallback",
+                    result.terminology_fallbacks,
+                )
+                self._count_metric(
+                    "mt_sentence_cache_hits", result.sentence_cache_hits
+                )
                 revision_key = (item.generation, item.utterance_id)
                 with self._latest_lock:
                     latest = self._latest_translation_revisions.get(revision_key, -1)
@@ -620,6 +870,18 @@ class RealtimePipeline:
                                 )
                             )
                         ),
+                        "terminology_matches": float(
+                            result.terminology_matches
+                        ),
+                        "mt_placeholder_retry": float(
+                            result.terminology_retries
+                        ),
+                        "mt_terminology_fallback": float(
+                            result.terminology_fallbacks
+                        ),
+                        "mt_sentence_cache_hits": float(
+                            result.sentence_cache_hits
+                        ),
                     },
                 )
                 if self.config.tts.enabled:
@@ -637,10 +899,13 @@ class RealtimePipeline:
                             self._tts_policy.cancel(request.phrase_id)
                         else:
                             self._count_metric("tts_requests_enqueued")
+                    self._collect_component_metrics(self._tts_policy)
                 if result.is_final:
                     with self._latest_lock:
                         self._latest_translation_revisions.pop(revision_key, None)
             except Exception as exc:
+                if isinstance(exc, TerminologyCoverageError):
+                    self._count_metric("mt_terminology_validation_error")
                 if isinstance(item, _TranslationJob) and item.request.is_final:
                     stream_id = (item.generation, item.utterance_id)
                     self._tts_policy.reset_stream(stream_id)

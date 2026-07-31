@@ -39,6 +39,7 @@ class WebRtcVadBackend:
         self._active = False
         self._silence_frames = 0
         self._frames_since_emit = 0
+        self._context_samples = 0
         self._started_at = monotonic()
         self._frame_samples = audio_config.sample_rate * audio_config.frame_ms // 1000
         self._padding_frames = max(1, config.speech_padding_ms // audio_config.frame_ms)
@@ -46,6 +47,11 @@ class WebRtcVadBackend:
         self._end_silence_frames = max(1, config.end_silence_ms // audio_config.frame_ms)
         self._emit_frames = max(1, audio_config.asr_chunk_ms // audio_config.frame_ms)
         self._max_frames = max(1, config.max_utterance_seconds * 1000 // audio_config.frame_ms)
+        self._endpoint_context_samples = (
+            (config.semantic_endpoint_context_ms or 0)
+            * audio_config.sample_rate
+            // 1_000
+        )
 
     def load(self) -> None:
         try:
@@ -66,6 +72,7 @@ class WebRtcVadBackend:
         self._active = False
         self._silence_frames = 0
         self._frames_since_emit = 0
+        self._context_samples = 0
         self._started_at = monotonic()
 
     def close(self) -> None:
@@ -154,7 +161,14 @@ class WebRtcVadBackend:
 
     def _snapshot(self, ended_at: float, is_final: bool) -> SpeechSegment:
         samples = np.concatenate(self._utterance) if self._utterance else np.empty(0, dtype=np.float32)
-        return SpeechSegment(samples, self.audio_config.sample_rate, self._started_at, ended_at, is_final)
+        return SpeechSegment(
+            samples,
+            self.audio_config.sample_rate,
+            self._started_at,
+            ended_at,
+            is_final,
+            context_samples=self._context_samples,
+        )
 
     def _finish(self, ended_at: float) -> SpeechSegment:
         segment = self._snapshot(ended_at, is_final=True)
@@ -169,7 +183,12 @@ class WebRtcVadBackend:
         )
         cut_sample = min(max(1, cut_sample), len(samples))
         prefix = samples[:cut_sample].copy()
-        suffix = samples[cut_sample:].copy()
+        overlap_samples = min(
+            self._endpoint_context_samples,
+            max(0, cut_sample - self._frame_samples),
+        )
+        suffix_start = cut_sample - overlap_samples
+        suffix = samples[suffix_start:].copy()
         old_started_at = self._started_at
         cut_ended_at = old_started_at + cut_sample / self.audio_config.sample_rate
         segment = SpeechSegment(
@@ -179,12 +198,17 @@ class WebRtcVadBackend:
             cut_ended_at,
             True,
             True,
+            self._context_samples,
         )
 
         self.reset()
         if suffix.size:
             self._active = True
-            self._started_at = cut_ended_at
+            self._started_at = (
+                old_started_at
+                + suffix_start / self.audio_config.sample_rate
+            )
+            self._context_samples = overlap_samples
             self._utterance = [
                 suffix[index : index + self._frame_samples].copy()
                 for index in range(0, len(suffix), self._frame_samples)
@@ -203,12 +227,19 @@ class PassthroughVad:
     """Test/file backend treating every received chunk as speech."""
 
     def __init__(self, config: VadConfig, audio_config: AudioConfig) -> None:
+        self.config = config
         self.audio_config = audio_config
         self._endpoint_requested = threading.Event()
         self._endpoint_lock = threading.Lock()
         self._endpoint_request: _EndpointRequest | None = None
         self._samples: list[np.ndarray] = []
         self._started_at = monotonic()
+        self._context_samples = 0
+        self._endpoint_context_samples = (
+            (config.semantic_endpoint_context_ms or 0)
+            * audio_config.sample_rate
+            // 1_000
+        )
 
     def load(self) -> None:
         pass
@@ -219,6 +250,7 @@ class PassthroughVad:
             self._endpoint_requested.clear()
         self._samples.clear()
         self._started_at = monotonic()
+        self._context_samples = 0
 
     def close(self) -> None:
         self.reset()
@@ -255,7 +287,12 @@ class PassthroughVad:
                     return self.flush()
                 cut_sample = min(max(1, endpoint.cut_sample), len(samples))
                 prefix = samples[:cut_sample].copy()
-                suffix = samples[cut_sample:].copy()
+                overlap_samples = min(
+                    self._endpoint_context_samples,
+                    max(0, cut_sample - 1),
+                )
+                suffix_start = cut_sample - overlap_samples
+                suffix = samples[suffix_start:].copy()
                 old_started_at = self._started_at
                 cut_ended_at = (
                     old_started_at + cut_sample / self.audio_config.sample_rate
@@ -267,20 +304,41 @@ class PassthroughVad:
                     cut_ended_at,
                     True,
                     True,
+                    self._context_samples,
                 )
                 self.reset()
                 if suffix.size:
                     self._samples = [suffix]
-                    self._started_at = cut_ended_at
+                    self._started_at = (
+                        old_started_at
+                        + suffix_start / self.audio_config.sample_rate
+                    )
+                    self._context_samples = overlap_samples
                 return [result]
         if chunk.end_of_stream:
             return self.flush()
-        return [SpeechSegment(samples, chunk.sample_rate, self._started_at, monotonic(), False)] if samples.size else []
+        return [
+            SpeechSegment(
+                samples,
+                chunk.sample_rate,
+                self._started_at,
+                monotonic(),
+                False,
+                context_samples=self._context_samples,
+            )
+        ] if samples.size else []
 
     def flush(self) -> list[SpeechSegment]:
         if not self._samples:
             return []
         samples = np.concatenate(self._samples)
-        result = SpeechSegment(samples, self.audio_config.sample_rate, self._started_at, monotonic(), True)
+        result = SpeechSegment(
+            samples,
+            self.audio_config.sample_rate,
+            self._started_at,
+            monotonic(),
+            True,
+            context_samples=self._context_samples,
+        )
         self.reset()
         return [result]

@@ -14,9 +14,14 @@ from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 from onevoice.audio import AudioFrameNormalizer, RealtimePacer, encode_wav, iter_audio_file
 from onevoice.backends.asr import asr_model_options, validate_asr_selection
+from onevoice.backends.translation import OpusMtCTranslate2Backend
 from onevoice.config import load_config
 from onevoice.models import EventType
 from onevoice.pipeline import RealtimePipeline
+from onevoice.terminology import (
+    TerminologyBuildInfo,
+    prepare_terminology_bundle,
+)
 from onevoice.text import ends_phrase
 
 
@@ -34,6 +39,12 @@ LANGUAGES = {
 }
 
 REALTIME_PROFILE = Path(__file__).resolve().parents[1] / "config" / "realtime_conversation.yaml"
+SAMPLE_TERMINOLOGY_BUNDLE = (
+    Path("assets")
+    / "terminology"
+    / "factory-sample-v1"
+    / "terminology.yaml"
+)
 PROFILE_DEFAULTS = load_config(REALTIME_PROFILE)
 
 
@@ -113,6 +124,40 @@ def _elapsed_between(end: float | None, start: float | None) -> float | None:
     return max(0.0, end - start)
 
 
+def _terminology_route_resolver(mt_backend: str):
+    if mt_backend == "opus_ct2":
+        return OpusMtCTranslate2Backend.route
+    return None
+
+
+def _render_terminology_build(
+    build: TerminologyBuildInfo,
+    *,
+    active: bool,
+) -> None:
+    label = "Active terminology" if active else "Terminology preflight"
+    st.success(
+        f"{label}: {build.bundle_id} · schema v{build.schema_version}"
+    )
+    st.caption(
+        f"{build.bundle_path} · SHA-256 {build.bundle_sha256[:12]}…"
+    )
+    st.caption(
+        f"{build.profile_count} profile · "
+        f"{build.entry_count} compiled entries · "
+        f"{build.asr_term_count} ASR terms · "
+        f"{build.mt_binding_count} MT bindings · "
+        f"{build.tts_spoken_form_count} TTS spoken forms"
+    )
+    routes = ", ".join(
+        "→".join(profile.mt_route) for profile in build.profiles
+    )
+    st.caption(
+        f"Domain: {build.selected_domain or 'bundle default'} · "
+        f"Routes: {routes}"
+    )
+
+
 if "runtime" not in st.session_state:
     st.session_state.runtime = {
         "pipeline": None,
@@ -143,7 +188,7 @@ with st.sidebar:
     target = target_options[target_label]
     asr_backend = st.selectbox(
         "ASR backend",
-        ("moonshine", "dolphin", "faster_whisper", "fake"),
+        ("moonshine", "sherpa_onnx", "dolphin", "faster_whisper", "fake"),
         disabled=controls_locked,
     )
     asr_models = asr_model_options(asr_backend, source)
@@ -155,6 +200,52 @@ with st.sidebar:
         asr_capability_error = str(exc)
         st.error(asr_capability_error)
     mt_backend = st.selectbox("MT backend", ("opus_ct2", "m2m100", "fake"), disabled=controls_locked)
+    terminology_enabled = st.checkbox(
+        "Bật terminology dictionary",
+        value=False,
+        disabled=controls_locked,
+        help="Bảo vệ thuật ngữ qua MT và khôi phục canonical form theo ngôn ngữ đích.",
+    )
+    terminology_domain = st.selectbox(
+        "Terminology domain",
+        ("factory-safety", "factory-maintenance", "test"),
+        disabled=controls_locked or not terminology_enabled,
+    )
+    terminology_bundle = st.text_input(
+        "Terminology bundle",
+        value=str(SAMPLE_TERMINOLOGY_BUNDLE),
+        disabled=controls_locked or not terminology_enabled,
+    )
+    terminology_preview_error = None
+    terminology_preview = None
+    if terminology_enabled and not controls_locked:
+        try:
+            _, terminology_preview = prepare_terminology_bundle(
+                terminology_bundle,
+                domain=terminology_domain,
+                source_language=source,
+                target_language=target,
+                case_sensitive_for_codes=(
+                    PROFILE_DEFAULTS.terminology.matching.case_sensitive_for_codes
+                ),
+                route_resolver=_terminology_route_resolver(mt_backend),
+            )
+        except Exception as exc:
+            terminology_preview_error = str(exc)
+            st.error(f"Terminology preflight failed: {exc}")
+        else:
+            _render_terminology_build(
+                terminology_preview,
+                active=False,
+            )
+    elif (
+        controls_locked
+        and runtime["pipeline"].terminology_build is not None
+    ):
+        _render_terminology_build(
+            runtime["pipeline"].terminology_build,
+            active=True,
+        )
     tts_enabled = st.checkbox("Bật phát giọng dịch (TTS)", value=False, disabled=controls_locked)
     tts_backend = st.selectbox(
         "TTS backend",
@@ -185,13 +276,18 @@ with st.sidebar:
             "Khởi tạo pipeline",
             type="primary",
             use_container_width=True,
-            disabled=asr_capability_error is not None,
+            disabled=(
+                asr_capability_error is not None
+                or terminology_preview_error is not None
+            ),
         ):
             config = load_config(REALTIME_PROFILE)
             config.asr.backend = asr_backend
             config.asr.model = asr_model
             config.asr.device = device
             config.asr.compute_type = compute_type
+            if asr_backend == "sherpa_onnx":
+                config.asr.sherpa.provider = device
             config.asr.language = source
             config.asr.offline = offline
             config.vad.semantic_endpoint_enabled = semantic_endpoint
@@ -205,6 +301,13 @@ with st.sidebar:
             config.translation.device = device
             config.translation.compute_type = compute_type
             config.translation.offline = offline
+            config.terminology.enabled = terminology_enabled
+            config.terminology.bundle_path = (
+                terminology_bundle if terminology_enabled else None
+            )
+            config.terminology.domain = (
+                terminology_domain if terminology_enabled else None
+            )
             config.tts.enabled = tts_enabled
             config.tts.backend = tts_backend
             config.tts.device = device
@@ -219,13 +322,14 @@ with st.sidebar:
                     runtime["pipeline"] = pipeline
                     runtime["normalizer"] = AudioFrameNormalizer(config.audio.sample_rate)
                     runtime["view"] = _empty_view()
-                    st.success("Pipeline đã sẵn sàng")
+                    st.rerun()
     else:
         st.success("Pipeline đã sẵn sàng")
         if st.button("Dừng và giải phóng model", use_container_width=True):
             runtime["pipeline"].close()
             runtime["pipeline"] = None
             runtime["mode"] = None
+            st.rerun()
 
 pipeline: RealtimePipeline | None = runtime["pipeline"]
 

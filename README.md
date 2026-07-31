@@ -57,6 +57,24 @@ python -m pip install -e ".[moonshine,opus,app]"
 python -m pip install -e ".[dolphin,app]"
 ```
 
+Để thử streaming Zipformer qua sherpa-onnx:
+
+```powershell
+python -m pip install -e ".[sherpa-asr,opus,app]"
+onevoice sample.wav --source vi --target en --asr-backend sherpa_onnx
+```
+
+Model được chọn tự động theo source `vi/en/zh/ko` và tải lần đầu vào
+`.cache/onevoice/asr`. Backend dùng `OnlineRecognizer`, giữ native stream state và
+chỉ feed phần waveform mới. Semantic endpoint có thể cắt final tại một sentence
+boundary cũ hơn snapshot mới nhất; backend sẽ decode lại final prefix trên stream
+mới rồi reset theo utterance, không giữ cursor lỗi sang câu sau. Model English
+dùng thêm punctuator online INT8 chính thức của sherpa-onnx để phục hồi dấu câu
+và casing; đặt `asr.sherpa.punctuation_enabled: false` nếu không muốn tải model
+phụ này. Model Vietnamese có punctuation nhưng vocabulary ALL CAPS, nên adapter
+chuẩn hóa về sentence case. Model Vietnamese dùng license CC-BY-NC-ND-4.0; cần
+review riêng trước khi dùng thương mại hoặc phân phối lại.
+
 Moonshine là model riêng theo từng ngôn ngữ nên không hỗ trợ `source=auto` trong adapter này. Chọn rõ `vi`, `en`, `zh` hoặc `ko`. Dolphin có LID/auto trong phạm vi ngôn ngữ mà model hỗ trợ, nhưng bản chính thức không có English.
 
 ## CLI smoke test
@@ -103,7 +121,18 @@ Các contract chính:
 
 Queue audio/ASR/MT/TTS đều có giới hạn. Khi audio overload, pipeline phát event, bỏ utterance bị đứt và reset generation để kết quả cũ không lọt xuống downstream. Partial ASR và MT được coalesce latest-only theo utterance; ASR final, MT final và TTS sinh từ final đi qua lane lossless.
 
-Mặc định pipeline tự đóng utterance khi stable/committed có đủ 2 câu hoàn chỉnh. Moonshine và Faster-Whisper trả word timestamps để pipeline ánh xạ từ cuối của câu stable sang sample cursor: câu sau có thể đã bắt đầu nhưng không bị nhập vào final, vì VAD cắt ngược tại boundary rồi giữ suffix làm đầu utterance kế tiếp. Backend không có timestamp vẫn dùng guard cũ và chỉ endpoint khi stable text cùng hypothesis mới nhất đều kết thúc tại boundary. Chỉnh `vad.semantic_endpoint_sentences`, hoặc đặt `vad.semantic_endpoint_enabled: false` để chỉ dùng khoảng lặng VAD và `max_utterance_seconds`.
+Mặc định pipeline tự đóng utterance khi stable/committed có đủ 2 câu hoàn chỉnh.
+Các backend có word timestamps, gồm streaming Zipformer, ánh xạ đúng boundary
+câu thứ N sang sample cursor. Khi endpoint đã pending, partial đến muộn bị freeze;
+câu sau được giữ trong suffix làm đầu utterance kế tiếp thay vì lọt vào final.
+Backend không có timestamp vẫn dùng fallback an toàn và chỉ endpoint khi stable
+text cùng hypothesis mới nhất đều kết thúc tại boundary. Chỉnh
+`vad.semantic_endpoint_sentences`, hoặc đặt
+`vad.semantic_endpoint_enabled: false` để chỉ dùng khoảng lặng VAD và
+`max_utterance_seconds`. Với Zipformer, `semantic_endpoint_context_ms: null`
+tự resolve thành 200 ms acoustic pre-roll cho suffix; phần pre-roll chỉ cấp
+context cho recognizer và bị loại khỏi transcript để không lặp cuối câu trước.
+Backend khác auto resolve thành 0.
 
 TTS phrase chỉ được commit sau khi synthesis thành công và consumer chấp nhận audio vào playback queue. Validity dựa trên generation và exact translated-prefix reservation: revision mới vẫn giữ phrase nếu content prefix không đổi, nhưng cancel reservation chưa synthesize khi content phân kỳ. Request bị queue drop, model lỗi hoặc event không giao được không bị coi nhầm là đã phát. Completed stream có idempotency guard để duplicate final không phát lại audio.
 
@@ -140,6 +169,19 @@ Theo dõi ASR/MT/TTS inference latency, thời gian đến output đầu tiên, 
 - [M2M100-418M](https://huggingface.co/facebook/m2m100_418M): MIT, hỗ trợ trực tiếp cả 12 hướng giữa bốn ngôn ngữ; backend convert Hugging Face weights một lần rồi inference bằng CTranslate2 với target-language prefix.
 - `streamlit-webrtc`: MIT.
 
-MT dùng hybrid wait-k: sentence boundary là trigger ưu tiên, nhưng partial vẫn chạy sau mỗi cụm token ổn định hoặc timeout để subtitle không phải chờ hết câu. Pending partial cùng utterance được coalesce latest-only; final đi qua lane lossless. Partial MT dịch toàn prefix một lần, còn final được dịch theo từng câu và giữ dấu kết thúc để giảm bỏ sót. TTS global default là `final_utterance`; riêng Streamlit/realtime profile dùng `stable_sentence`, chỉ phát target sentence hoàn chỉnh đã đồng thuận hoặc tail từ final. Hard maximum vẫn là 24 token và UI ghép internal chunk theo câu trước khi autoplay. VAD semantic endpoint và TTS emission là hai policy độc lập. Backend `sherpa_onnx` tự chọn voice theo target language, tải lần đầu vào `.cache/onevoice/tts` và tái sử dụng cache; UI không yêu cầu đường dẫn model. `offline: true` sẽ fail sớm nếu voice chưa được cache.
+MT dùng hybrid wait-k: sentence boundary là trigger ưu tiên, nhưng partial vẫn chạy
+sau mỗi cụm token ổn định hoặc timeout để subtitle không phải chờ hết câu.
+Pending partial cùng utterance được coalesce latest-only; final đi qua lane
+lossless. Khi bật terminology, OPUS/M2M100 split cả partial theo câu: completed
+sentence được cache bằng exact source text + stream ID, còn mutable tail luôn
+dịch lại. Final tái sử dụng cache rồi xóa state của utterance. Khi terminology
+tắt, partial vẫn dùng một growing-prefix request như trước. TTS global default
+là `final_utterance`; riêng Streamlit/realtime profile dùng `stable_sentence`,
+chỉ phát target sentence hoàn chỉnh đã đồng thuận hoặc tail từ final. Hard
+maximum vẫn là 24 token và UI ghép internal chunk theo câu trước khi autoplay.
+VAD semantic endpoint và TTS emission là hai policy độc lập. Backend
+`sherpa_onnx` tự chọn voice theo target language, tải lần đầu vào
+`.cache/onevoice/tts` và tái sử dụng cache; UI không yêu cầu đường dẫn model.
+`offline: true` sẽ fail sớm nếu voice chưa được cache.
 
 Các profile mẫu nằm trong `config/realtime_conversation.yaml` (endpoint 1 câu), `config/continuous_speech.yaml` (2 câu) và `config/stable_demo.yaml` (agreement bảo thủ hơn). Truyền profile bằng `onevoice sample.wav --config config/<profile>.yaml`; profile được deep-merge lên `config/default.yaml`, nên field không khai báo vẫn giữ nguyên model/language/device/cache mặc định.

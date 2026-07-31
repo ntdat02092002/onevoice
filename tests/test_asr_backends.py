@@ -173,3 +173,7 @@ def test_asr_capabilities_fail_before_model_loading() -> None:
         )
     with pytest.raises(ValueError, match="does not support English"):
         DolphinAsrBackend(AsrConfig(backend="dolphin", language="en", model="base"))
+
+    assert asr_model_options("sherpa_onnx", "vi") == (
+        "hynt-zipformer-vi-30m-streaming-6000h-chunk-32",
+    )

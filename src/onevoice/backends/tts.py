@@ -255,7 +255,7 @@ class SherpaOnnxTtsBackend:
             generation.num_steps = self.config.num_steps
             generation.extra["lang"] = request.language
         started = monotonic()
-        audio = self._tts.generate(request.text, generation)
+        audio = self._tts.generate(request.synthesis_text, generation)
         samples = np.asarray(audio.samples, dtype=np.float32)
         if samples.size == 0:
             raise RuntimeError("sherpa-onnx generated empty TTS audio")
@@ -269,6 +269,7 @@ class SherpaOnnxTtsBackend:
             phrase_id=request.phrase_id,
             started_at=started,
             source_is_final=request.source_is_final,
+            spoken_text=request.spoken_text,
         )
 
 
@@ -290,7 +291,10 @@ class FakeTtsBackend:
     def synthesize(self, request: TtsRequest) -> TtsUpdate:
         started = monotonic()
         sample_rate = 16_000
-        duration = max(0.08, min(0.5, len(request.text) * 0.015))
+        duration = max(
+            0.08,
+            min(0.5, len(request.synthesis_text) * 0.015),
+        )
         time_axis = np.arange(int(sample_rate * duration), dtype=np.float32) / sample_rate
         samples = (0.02 * np.sin(2 * np.pi * 440 * time_axis)).astype(np.float32)
         return TtsUpdate(
@@ -303,4 +307,5 @@ class FakeTtsBackend:
             phrase_id=request.phrase_id,
             started_at=started,
             source_is_final=request.source_is_final,
+            spoken_text=request.spoken_text,
         )

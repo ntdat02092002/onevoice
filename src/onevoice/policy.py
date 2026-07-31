@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import threading
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from time import monotonic
 
 from .config import TranslationConfig, TtsConfig
 from .models import CommittedTranscript, TranslationRequest, TranslationUpdate, TtsRequest
+from .terminology import TerminologyManager
+from .terminology.matcher import TermPrefixTrie
+from .terminology.profile import TerminologyProfile
+from .terminology.runtime import TerminologyTtsNormalizer
 from .text import (
     detokenize,
     ends_phrase,
@@ -117,6 +121,29 @@ class PhraseTtsPolicy:
         self._completed_stream_order: deque[StreamId] = deque()
         self._next_phrase_id = 1
         self._lock = threading.RLock()
+        self._terminology_manager: TerminologyManager | None = None
+        self._terminology_domain: str | None = None
+        self._target_profiles: dict[str, TerminologyProfile] = {}
+        self._tts_normalizers: dict[str, TerminologyTtsNormalizer] = {}
+        self._metrics: Counter[str] = Counter()
+
+    def configure_terminology(
+        self,
+        manager: TerminologyManager,
+        *,
+        domain: str | None,
+    ) -> None:
+        with self._lock:
+            self._terminology_manager = manager
+            self._terminology_domain = domain
+            self._target_profiles.clear()
+            self._tts_normalizers.clear()
+
+    def take_metrics(self) -> dict[str, int]:
+        with self._lock:
+            output = dict(self._metrics)
+            self._metrics.clear()
+            return output
 
     def reset(self) -> None:
         with self._lock:
@@ -186,6 +213,9 @@ class PhraseTtsPolicy:
             absolute_boundaries = sentence_token_boundaries(
                 update.text, update.target_language
             )
+            protected_spans = self._protected_spans(
+                stable, update.target_language
+            )
 
             while cursor < len(stable):
                 remaining = stable[cursor:]
@@ -194,11 +224,17 @@ class PhraseTtsPolicy:
                     for boundary in absolute_boundaries
                     if cursor < boundary <= len(stable)
                 )
+                relative_protected_spans = tuple(
+                    (max(0, start - cursor), end - cursor)
+                    for start, end in protected_spans
+                    if cursor < end
+                )
                 endpoint = self._find_endpoint(
                     remaining,
                     update.is_final,
                     timed_out,
                     relative_boundaries,
+                    relative_protected_spans,
                     mode,
                 )
                 if endpoint is None:
@@ -214,14 +250,21 @@ class PhraseTtsPolicy:
                 )
                 state.reservations.append(reservation)
                 self._phrase_streams[phrase_id] = stream_id
+                display_text = detokenize(
+                    chunk_tokens, update.target_language
+                )
+                spoken_text = self._spoken_text(
+                    display_text, update.target_language
+                )
                 requests.append(
                     TtsRequest(
-                        text=detokenize(chunk_tokens, update.target_language),
+                        text=display_text,
                         language=update.target_language,
                         source_revision=update.source_revision,
                         is_final=is_last_final,
                         phrase_id=phrase_id,
                         source_is_final=update.is_final,
+                        spoken_text=spoken_text,
                     )
                 )
                 state.last_reserve_at = now
@@ -231,6 +274,50 @@ class PhraseTtsPolicy:
                 self._states.pop(stream_id, None)
                 self._mark_completed(stream_id)
             return requests
+
+    def _target_profile(
+        self, language: str
+    ) -> TerminologyProfile | None:
+        if self._terminology_manager is None:
+            return None
+        profile = self._target_profiles.get(language)
+        if profile is None:
+            profile = self._terminology_manager.activate(
+                domain=self._terminology_domain,
+                source_language=language,
+                target_language=language,
+            )
+            self._target_profiles[language] = profile
+        return profile
+
+    def _target_trie(self, language: str) -> TermPrefixTrie | None:
+        profile = self._target_profile(language)
+        return profile.target_trie if profile is not None else None
+
+    def _protected_spans(
+        self, tokens: tuple[str, ...], language: str
+    ) -> tuple[tuple[int, int], ...]:
+        trie = self._target_trie(language)
+        return trie.term_spans(tokens) if trie is not None else ()
+
+    def _spoken_text(
+        self, display_text: str, language: str
+    ) -> str | None:
+        profile = self._target_profile(language)
+        if profile is None:
+            return None
+        normalizer = self._tts_normalizers.get(language)
+        if normalizer is None:
+            normalizer = TerminologyTtsNormalizer(profile)
+            self._tts_normalizers[language] = normalizer
+        result = normalizer.normalize(display_text)
+        if not result.changed:
+            return None
+        self._metrics["tts_spoken_form_requests"] += 1
+        self._metrics["tts_spoken_form_substitutions"] += (
+            result.substitutions
+        )
+        return result.spoken_text
 
     def is_reserved(self, phrase_id: int) -> bool:
         with self._lock:
@@ -337,6 +424,7 @@ class PhraseTtsPolicy:
         is_final: bool,
         timed_out: bool,
         sentence_boundaries: tuple[int, ...],
+        protected_spans: tuple[tuple[int, int], ...],
         mode: str,
     ) -> int | None:
         maximum = min(len(tokens), self.config.max_chunk_tokens)
@@ -344,18 +432,18 @@ class PhraseTtsPolicy:
         # A complete short sentence is meaningful and may be shorter than the
         # configured minimum. The configured maximum remains a hard limit.
         if sentence_end is not None and sentence_end <= maximum:
-            return sentence_end
+            return self._safe_endpoint(sentence_end, protected_spans)
         if mode == "stable_sentence" and not is_final and sentence_end is None:
             return None
         if sentence_end == maximum + 1 and maximum - 1 >= self.config.min_chunk_tokens:
-            return maximum - 1
+            return self._safe_endpoint(maximum - 1, protected_spans)
         if len(tokens) > maximum:
             for index in range(maximum, self.config.min_chunk_tokens - 1, -1):
                 if tokens[index - 1] in {",", ";", ":"}:
-                    return index
-            return maximum
+                    return self._safe_endpoint(index, protected_spans)
+            return self._safe_endpoint(maximum, protected_spans)
         if len(tokens) == maximum and mode == "stable_phrase":
-            return maximum
+            return self._safe_endpoint(maximum, protected_spans)
         if is_final:
             return len(tokens)
         if mode == "stable_sentence":
@@ -365,3 +453,18 @@ class PhraseTtsPolicy:
         ):
             return len(tokens)
         return None
+
+    def _safe_endpoint(
+        self,
+        endpoint: int,
+        protected_spans: tuple[tuple[int, int], ...],
+    ) -> int:
+        for start, end in protected_spans:
+            if start < endpoint < end:
+                self._metrics["tts_term_boundary_shifts"] += 1
+                if start >= self.config.min_chunk_tokens:
+                    return start
+                if end - start > self.config.max_chunk_tokens:
+                    self._metrics["tts_oversized_protected_spans"] += 1
+                return end
+        return endpoint

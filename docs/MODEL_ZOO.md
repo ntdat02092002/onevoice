@@ -24,6 +24,7 @@ Ngôn ngữ sản phẩm:
 | `moonshine` | `ko` | `auto`, `tiny` | Không | Không có weights streaming riêng | `moonshine` |
 | `dolphin` | `auto`, `vi`, `zh`, `ko` | `base`, `small` | Có, trong tập ngôn ngữ Dolphin hỗ trợ | Không; adapter decode growing utterance | `dolphin` |
 | `faster_whisper` | `auto`, `vi`, `en`, `zh`, `ko` | `tiny`, `base`, `small` trong UI; config có thể dùng Whisper model ID hợp lệ khác | Có | Không; adapter decode lại growing utterance | `models` |
+| `sherpa_onnx` | `vi`, `en`, `zh`, `ko` | `auto` hoặc model streaming mặc định đúng language | Không | Có; `OnlineRecognizer` Zipformer | `sherpa-asr` |
 | `fake` | mọi language sản phẩm | `fake` | Giả lập | Giả lập | Không |
 
 `Moonshine model=auto` là tự chọn **architecture cho language đã biết**, không phải tự nhận diện language. Với catalog hiện tại, nó resolve `en -> medium_streaming`, `vi -> base`, `zh -> base`, `ko -> tiny`.
@@ -60,6 +61,34 @@ Ngôn ngữ sản phẩm:
 - Adapter bật `word_timestamps=True` để cung cấp sentence-end cursor cho semantic endpoint.
 - Đây là fallback đa ngôn ngữ. Adapter hiện decode lại toàn growing utterance nên thường kém hiệu quả hơn Moonshine native streaming cho mic realtime.
 - License implementation Faster-Whisper: MIT; license weights phụ thuộc model được chọn.
+
+### Sherpa-ONNX Streaming Zipformer
+
+- Mỗi utterance giữ một native stream và chỉ feed phần waveform chưa xử lý.
+- Adapter ghép token timestamps của OnlineRecognizer thành
+  `AsrUpdate.words`; semantic endpoint `N` cắt đúng cuối câu thứ N, không phải
+  cuối sentence batch mới nhất.
+- Suffix Zipformer giữ 200 ms acoustic context mặc định để không mất âm đầu câu
+  kế tiếp. Adapter lọc các token thuộc context trước khi publish nên không lặp
+  cuối câu trước; backend khác mặc định không thêm overlap này.
+- Semantic endpoint được phép tạo final prefix ngắn hơn snapshot partial mới
+  nhất. Backend decode lại prefix đó trên stream mới vì transducer không thể
+  rút audio đã feed, rồi reset trước utterance tiếp theo.
+- Model English upstream xuất text không punctuation và ALL CAPS. Mặc định
+  adapter tải `sherpa-onnx-online-punct-en-2024-08-06` INT8 để thêm punctuation
+  và casing trong mỗi revision.
+- Model Vietnamese `hynt` có punctuation nhưng vocabulary ALL CAPS; adapter
+  chuẩn hóa sentence case. Chinese/Korean giữ nguyên output model.
+- Có thể tắt punctuator English bằng
+  `asr.sherpa.punctuation_enabled: false`; khi đó semantic endpoint theo dấu câu
+  không có boundary đáng tin cậy cho model English này.
+- Khi terminology được bật, backend dùng native hotwords theo từng Sherpa stream.
+  Pipeline tự chuyển `greedy_search` sang `modified_beam_search`, vì Sherpa chỉ
+  hỗ trợ contextual bias cho Transducer ở decoding mode này.
+- Profile được giới hạn bằng `max_hotword_terms` và `max_hotword_tokens`. BPE
+  model dùng `bpe.model`/`bpe.vocab`; Chinese dùng `cjkchar`. Term không biểu diễn
+  được bằng tokenizer bị loại và được đếm trong
+  `asr_hotword_rejection_count`; exact-alias post-correction vẫn là fallback.
 
 ## Machine Translation
 
@@ -158,9 +187,20 @@ vad:
   max_utterance_seconds: 15
   semantic_endpoint_enabled: true
   semantic_endpoint_sentences: 2
+  semantic_endpoint_context_ms: null
 ```
 
-Semantic endpoint đóng utterance khi stable/committed có đủ số câu hoàn chỉnh. Nếu ASR có word timestamps, pipeline đối chiếu lexical prefix của câu stable với các timed word, lấy `end_seconds` của từ cuối và đổi thành `cut_sample`; trailing fragment của câu tiếp theo không chặn endpoint và được giữ nguyên trong suffix. Nếu timestamp thiếu hoặc không khớp hypothesis, pipeline fallback an toàn: chỉ endpoint khi cả stable text lẫn ASR hypothesis mới nhất đều kết thúc tại sentence boundary. VAD chỉ áp dụng request có đúng utterance `started_at`, trả prefix thành final và chuyển suffix đã buffer sang utterance kế tiếp. Đặt `semantic_endpoint_enabled: false` để chỉ dùng silence/max-duration endpoint.
+Semantic endpoint đóng utterance khi stable/committed có đủ số câu hoàn chỉnh.
+Nếu ASR có word timestamps, pipeline đối chiếu lexical prefix, lấy
+`end_seconds` của từ cuối câu thứ N và đổi thành `cut_sample`. Sau khi request,
+pipeline freeze partial muộn cho utterance đó; trailing fragment/câu tiếp theo
+được giữ nguyên trong suffix. Nếu timestamp thiếu hoặc không khớp hypothesis,
+pipeline fallback an toàn: chỉ endpoint khi cả stable text lẫn ASR hypothesis
+mới nhất đều kết thúc tại sentence boundary. VAD chỉ áp dụng request có đúng
+utterance `started_at`, trả prefix thành final và chuyển suffix đã buffer sang
+utterance kế tiếp. Đặt `semantic_endpoint_enabled: false` để chỉ dùng
+silence/max-duration endpoint. `semantic_endpoint_context_ms: null` dùng chế độ
+auto: 200 ms cho Zipformer và 0 cho backend khác.
 
 ## Audio preprocessing, commit và translation policy
 
@@ -187,6 +227,11 @@ translation:
 ```
 
 Local Agreement chỉ làm immutable các completed sentence. Fragment của current sentence vẫn mutable: nếu ASR sửa token đầu, policy chờ đủ agreement rồi emit revision mới thay vì freeze đến final. MT queue/revision guard nhận các revision này và chỉ giữ pending partial mới nhất.
+
+Khi terminology được bật, OPUS/M2M100 split partial thành completed sentences và
+mutable tail. Completed sentence được cache theo exact text và stream identity;
+tail luôn dịch lại. Source correction không thể dùng nhầm cache vì exact key sẽ
+miss. Final reuse các sentence còn khớp rồi xóa cache của utterance.
 
 ## Streamlit realtime và metric file
 

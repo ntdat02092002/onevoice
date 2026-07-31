@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import Counter
+from enum import StrEnum
 from math import isfinite
 from pathlib import Path
 from time import monotonic
@@ -9,6 +11,10 @@ import numpy as np
 
 from onevoice.config import AsrConfig
 from onevoice.models import AsrUpdate, AsrWordTiming, SpeechSegment
+from onevoice.sherpa_models import (
+    DEFAULT_SHERPA_STREAMING_MODEL_BY_LANGUAGE,
+    SHERPA_STREAMING_MODELS,
+)
 from onevoice.text import tokenize_text
 
 
@@ -25,6 +31,13 @@ DOLPHIN_MODELS = ("base", "small")
 FASTER_WHISPER_MODELS = ("tiny", "base", "small")
 
 
+class AsrTerminologyCapability(StrEnum):
+    NONE = "none"
+    INITIAL_PROMPT = "initial_prompt"
+    NATIVE_HOTWORDS = "native_hotwords"
+    POST_CORRECTION = "post_correction"
+
+
 def asr_model_options(backend: str, language: str) -> tuple[str, ...]:
     """Return built-in model choices without importing any model runtime."""
     if backend == "moonshine":
@@ -33,6 +46,9 @@ def asr_model_options(backend: str, language: str) -> tuple[str, ...]:
         return DOLPHIN_MODELS
     if backend == "faster_whisper":
         return FASTER_WHISPER_MODELS
+    if backend == "sherpa_onnx":
+        model = DEFAULT_SHERPA_STREAMING_MODEL_BY_LANGUAGE.get(language)
+        return (model,) if model else ("auto",)
     if backend == "fake":
         return ("fake",)
     return ()
@@ -62,6 +78,24 @@ def validate_asr_selection(backend: str, model: str, language: str) -> None:
             raise ValueError(
                 f"Dolphin model {model!r} is unsupported; supported models: "
                 f"{', '.join(DOLPHIN_MODELS)}"
+            )
+    elif backend == "sherpa_onnx":
+        if language not in DEFAULT_SHERPA_STREAMING_MODEL_BY_LANGUAGE:
+            raise ValueError(
+                "sherpa_onnx streaming Zipformer requires vi, en, zh, or ko"
+            )
+        if model == "auto":
+            return
+        try:
+            spec = SHERPA_STREAMING_MODELS[model]
+        except KeyError as exc:
+            raise ValueError(
+                f"sherpa_onnx streaming model {model!r} is unsupported"
+            ) from exc
+        if spec.language != language:
+            raise ValueError(
+                f"sherpa_onnx model {model!r} supports {spec.language!r}, "
+                f"not {language!r}"
             )
     elif backend in ("faster_whisper", "fake") and not model.strip():
         raise ValueError(f"{backend} requires a non-empty model name")
@@ -123,6 +157,7 @@ class MoonshineAsrBackend:
     SpeechSegment partials are growing snapshots. Only the unseen tail is added
     to Moonshine, preventing the repeated full-utterance work done by Whisper.
     """
+    terminology_capability = AsrTerminologyCapability.POST_CORRECTION
 
     def __init__(self, config: AsrConfig) -> None:
         validate_asr_selection("moonshine", config.model, config.language)
@@ -281,6 +316,7 @@ class MoonshineAsrBackend:
 
 class DolphinAsrBackend:
     """Dolphin Base/Small adapter for Vietnamese, Mandarin and Korean."""
+    terminology_capability = AsrTerminologyCapability.POST_CORRECTION
 
     def __init__(self, config: AsrConfig) -> None:
         validate_asr_selection("dolphin", config.model, config.language)
@@ -362,11 +398,30 @@ class DolphinAsrBackend:
 
 
 class FasterWhisperBackend:
+    terminology_capability = AsrTerminologyCapability.INITIAL_PROMPT
+
     def __init__(self, config: AsrConfig) -> None:
         validate_asr_selection("faster_whisper", config.model, config.language)
         self.config = config
         self._model = None
         self._revision = 0
+        self._initial_prompt: str | None = None
+        self._metrics: Counter[str] = Counter()
+
+    def configure_terminology_prompt(
+        self, terms: tuple[str, ...]
+    ) -> None:
+        self._initial_prompt = "; ".join(terms) or None
+        self._metrics["asr_prompt_term_count"] = len(terms)
+        self._metrics["asr_prompt_token_count"] = sum(
+            len(tokenize_text(term, self.config.language))
+            for term in terms
+        )
+
+    def take_metrics(self) -> dict[str, int]:
+        output = dict(self._metrics)
+        self._metrics.clear()
+        return output
 
     def load(self) -> None:
         try:
@@ -399,6 +454,7 @@ class FasterWhisperBackend:
             condition_on_previous_text=False,
             vad_filter=False,
             word_timestamps=True,
+            initial_prompt=self._initial_prompt,
         )
         segments = list(segments)
         text = " ".join(item.text.strip() for item in segments if item.text.strip()).strip()
@@ -436,6 +492,7 @@ class FasterWhisperBackend:
 
 
 class FakeAsrBackend:
+    terminology_capability = AsrTerminologyCapability.POST_CORRECTION
     def __init__(self, config: AsrConfig, script: Iterable[str] | None = None) -> None:
         validate_asr_selection("fake", config.model, config.language)
         self.config = config
