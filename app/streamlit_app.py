@@ -12,7 +12,13 @@ import numpy as np
 import streamlit as st
 from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
-from onevoice.audio import AudioFrameNormalizer, RealtimePacer, encode_wav, iter_audio_file
+from onevoice.audio import (
+    AudioFrameNormalizer,
+    PlaybackDeadline,
+    RealtimePacer,
+    encode_wav,
+    iter_audio_file,
+)
 from onevoice.backends.asr import asr_model_options, validate_asr_selection
 from onevoice.backends.translation import OpusMtCTranslate2Backend
 from onevoice.config import load_config
@@ -72,7 +78,7 @@ def _empty_view() -> dict[str, Any]:
         "tts_pending_audio": [],
         "tts_seen_phrase_ids": set(),
         "tts_playing": None,
-        "tts_playing_started_at": 0.0,
+        "tts_playback_deadline": None,
         "file_session": False,
         "file_complete": False,
         "file_realtime": True,
@@ -83,6 +89,7 @@ def _empty_view() -> dict[str, Any]:
         "input_finished_at": None,
         "input_finished_monotonic": None,
         "output_started_at": None,
+        "output_playback_finished_at": None,
         "asr_final_monotonic": None,
         "mt_final_monotonic": None,
         "tts_final_monotonic": None,
@@ -554,16 +561,29 @@ def realtime_results() -> None:
 
     playing_speech = view["tts_playing"]
     if playing_speech is not None:
-        elapsed = time.monotonic() - view["tts_playing_started_at"]
-        if elapsed >= playing_speech.duration_seconds + 0.15:
+        playback_deadline = view["tts_playback_deadline"]
+        if (
+            playback_deadline is not None
+            and playback_deadline.reached(time.monotonic())
+        ):
+            view["output_playback_finished_at"] = (
+                playback_deadline.finish_wall_at
+            )
             view["tts_playing"] = None
+            view["tts_playback_deadline"] = None
             playing_speech = None
     if playing_speech is None and view["tts_pending_audio"]:
         playing_speech = view["tts_pending_audio"].pop(0)
         view["tts_playing"] = playing_speech
-        view["tts_playing_started_at"] = time.monotonic()
+        playback_started_monotonic = time.monotonic()
+        playback_started_wall = time.time()
+        view["tts_playback_deadline"] = PlaybackDeadline.start(
+            playing_speech.duration_seconds,
+            monotonic_now=playback_started_monotonic,
+            wall_now=playback_started_wall,
+        )
         if view["file_session"] and view["output_started_at"] is None:
-            view["output_started_at"] = time.time()
+            view["output_started_at"] = playback_started_wall
 
     st.subheader("Kết quả realtime")
     st.write(f"Trạng thái: **{view['status']}** · Ngôn ngữ: **{view['language']}**")
@@ -641,13 +661,25 @@ def realtime_results() -> None:
             delta=None if overhead is None else f"{overhead:+.2f}s beyond media duration",
             delta_color="off",
         )
-        start_metric, input_end_metric, output_start_metric, end_metric = st.columns(4)
+        (
+            start_metric,
+            input_end_metric,
+            output_start_metric,
+            synthesis_end_metric,
+            playback_end_metric,
+        ) = st.columns(5)
         start_metric.metric("Input started at", _format_clock(view["input_started_at"]))
         input_end_metric.metric("Input finished at", _format_clock(view["input_finished_at"]))
         output_start_metric.metric(
             "Output playback started at", _format_clock(view["output_started_at"])
         )
-        end_metric.metric("TTS finished at", _format_clock(view["tts_finished_at"]))
+        synthesis_end_metric.metric(
+            "TTS finished at", _format_clock(view["tts_finished_at"])
+        )
+        playback_end_metric.metric(
+            "Playback finished at (estimated)",
+            _format_clock(view["output_playback_finished_at"]),
+        )
         input_end = view["input_finished_monotonic"]
         asr_end = view["asr_final_monotonic"]
         mt_end = view["mt_final_monotonic"]

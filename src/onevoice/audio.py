@@ -14,6 +14,38 @@ import numpy as np
 from .models import AudioChunk
 
 
+@dataclass(frozen=True, slots=True)
+class PlaybackDeadline:
+    """Server-side estimate for one autoplay item's media completion."""
+
+    finish_monotonic: float
+    finish_wall_at: float
+
+    @classmethod
+    def start(
+        cls,
+        duration_seconds: float,
+        *,
+        monotonic_now: float,
+        wall_now: float,
+    ) -> "PlaybackDeadline":
+        duration = max(0.0, duration_seconds)
+        return cls(
+            finish_monotonic=monotonic_now + duration,
+            finish_wall_at=wall_now + duration,
+        )
+
+    def reached(
+        self,
+        monotonic_now: float,
+        *,
+        guard_seconds: float = 0.15,
+    ) -> bool:
+        return monotonic_now >= (
+            self.finish_monotonic + max(0.0, guard_seconds)
+        )
+
+
 @dataclass(slots=True)
 class RealtimePacer:
     """Pace media against an absolute timeline without accumulating sleep drift."""

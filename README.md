@@ -198,7 +198,12 @@ Live microphone dùng `streamlit-webrtc`; inference không chạy trong audio ca
 
 Streamlit khởi tạo từ `config/realtime_conversation.yaml`: semantic endpoint 1 câu, MT hybrid wait-k `6/4/1200 ms` với minimum interval `500 ms`, và TTS `stable_sentence` qua 2 translation revisions. Default an toàn trong `config/default.yaml` vẫn là TTS `final_utterance`; CLI chỉ dùng realtime profile khi được truyền `--config`.
 
-TTS partial được autoplay theo từng target sentence hoàn chỉnh. Nếu một câu vượt hard maximum 24 token, UI chỉ ghép các internal chunk của chính câu đó rồi đưa vào playback queue; không chờ toàn utterance. Khi chạy file, feeder pace theo absolute media timeline để không tích lũy sai số `sleep` trên Windows. Sau khi hoàn tất, UI tạo player và WAV toàn file, đồng thời hiển thị input/output duration, time-to-output, synthesis timeline, feed drift và post-input ASR/MT/TTS tail latency.
+TTS partial được autoplay theo từng target sentence hoàn chỉnh. Nếu một câu vượt hard maximum 24 token, UI chỉ ghép các internal chunk của chính câu đó rồi đưa vào playback queue; không chờ toàn utterance. Khi chạy file, feeder pace theo absolute media timeline để không tích lũy sai số `sleep` trên Windows. Sau khi hoàn tất, UI tạo player và WAV toàn file, đồng thời hiển thị input/output duration, time-to-output, synthesis timeline, thời điểm playback dự kiến kết thúc, feed drift và post-input ASR/MT/TTS tail latency.
+
+`Playback finished at (estimated)` được tính từ thời điểm server đưa từng phrase
+vào autoplay cộng đúng duration audio và chỉ được ghi nhận khi scheduler đã chạy
+hết phrase. Đây không phải browser/loa `ended` telemetry vì `st.audio` không gửi
+event đó về Python.
 
 - `localhost` được browser xem là secure context và dùng mic trực tiếp.
 - Deploy remote cần HTTPS.

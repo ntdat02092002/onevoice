@@ -284,11 +284,16 @@ miss. Final reuse các sentence còn khớp rồi xóa cache của utterance.
 Streamlit dùng realtime profile (semantic endpoint 1 câu và TTS `stable_sentence`). File feeder pace theo absolute media timeline để sai số scheduler của từng frame không cộng dồn. Khi hoàn tất, UI tạo player cùng file WAV TTS toàn bộ và hiển thị:
 
 - input/output duration và realtime feed drift;
-- input start/end, output playback start, TTS synthesis finish;
+- input start/end, output playback start, TTS synthesis finish và estimated
+  playback finish;
 - `End-to-end elapsed`, bao gồm thời lượng media;
 - ASR `input end -> final`, MT `ASR final -> MT final`, TTS `MT final -> ready`, và `Total after input`.
 
-Các stage chạy overlap nên giá trị âm được clamp về `0 ms`. `TTS finished at` không phải playback end; nếu output duration dài hơn input thì người nghe vẫn có playback tail.
+Các stage chạy overlap nên giá trị âm được clamp về `0 ms`. `TTS finished at`
+không phải playback end. `Playback finished at (estimated)` dùng thời điểm
+server bắt đầu autoplay cộng media duration và được publish sau khi playback
+scheduler kết thúc phrase cuối; `st.audio` không cung cấp browser `ended`
+callback về Python.
 
 ## Recipe đề xuất
 

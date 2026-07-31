@@ -4,7 +4,12 @@ import wave
 import numpy as np
 import pytest
 
-from onevoice.audio import RealtimePacer, encode_wav, iter_audio_file
+from onevoice.audio import (
+    PlaybackDeadline,
+    RealtimePacer,
+    encode_wav,
+    iter_audio_file,
+)
 from onevoice.models import AudioChunk
 
 
@@ -53,3 +58,27 @@ def test_realtime_pacer_compensates_previous_sleep_drift() -> None:
     # The first frame ran 5 ms late, so the second sleep is shortened rather
     # than adding another full 20 ms and accumulating drift across the file.
     assert pacer.delay_after(0.02, now=10.025) == pytest.approx(0.015)
+
+
+def test_playback_deadline_tracks_media_finish_and_poll_guard() -> None:
+    deadline = PlaybackDeadline.start(
+        2.5,
+        monotonic_now=10.0,
+        wall_now=1_000.0,
+    )
+
+    assert deadline.finish_monotonic == pytest.approx(12.5)
+    assert deadline.finish_wall_at == pytest.approx(1_002.5)
+    assert not deadline.reached(12.64)
+    assert deadline.reached(12.65)
+
+
+def test_playback_deadline_clamps_negative_duration_and_guard() -> None:
+    deadline = PlaybackDeadline.start(
+        -1.0,
+        monotonic_now=10.0,
+        wall_now=1_000.0,
+    )
+
+    assert deadline.finish_wall_at == pytest.approx(1_000.0)
+    assert deadline.reached(10.0, guard_seconds=-1.0)
