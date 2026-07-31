@@ -6,11 +6,13 @@ Pipeline dịch giọng nói offline, dạng module, hỗ trợ Việt (`vi`), A
 WebRTC microphone / audio file
   -> PCM 16 kHz mono
   -> WebRTC VAD
-  -> Moonshine native streaming ASR (Dolphin/Faster-Whisper optional)
-  -> Local Agreement: locked completed sentences + mutable current fragment
+  -> Moonshine / Sherpa streaming ASR (Dolphin/Faster-Whisper optional)
+  -> ASR terminology guidance + exact-alias canonicalization (optional)
+  -> Term-aware Local Agreement: locked sentences + mutable fragment
   -> Wait-k policy
-  -> OPUS-MT or M2M100 + CTranslate2 INT8 translation
-  -> Sentence-aware Local Agreement phrase chunker (8–24 token)
+  -> Terminology-safe OPUS-MT or M2M100 + CTranslate2 INT8
+  -> Term-aware sentence phrase chunker (8–24 token)
+  -> Display text / TTS spoken-form normalization
   -> sherpa-onnx VITS/Piper TTS (optional)
   -> CLI / Streamlit audio events
 ```
@@ -27,6 +29,9 @@ python -m pip install -e ".[moonshine,opus,app,dev]"
 
 # Thêm TTS offline
 python -m pip install -e ".[moonshine,opus,tts,app,dev]"
+
+# Stack Sherpa streaming Zipformer + OPUS + UI
+python -m pip install -e ".[sherpa-asr,opus,app,dev]"
 ```
 
 Project khóa `transformers>=4.46,<5`. Nhánh Transformers 5.x có thể lazy-import các image processor như ZoeDepth và đòi `torchvision` dù pipeline chỉ xử lý text; không cài `torchvision` để chữa lỗi này.
@@ -62,6 +67,11 @@ python -m pip install -e ".[dolphin,app]"
 ```powershell
 python -m pip install -e ".[sherpa-asr,opus,app]"
 onevoice sample.wav --source vi --target en --asr-backend sherpa_onnx
+
+# Bật sample terminology profile
+onevoice sample.wav --source en --target vi --asr-backend sherpa_onnx `
+  --terminology-bundle assets/terminology/factory-sample-v1/terminology.yaml `
+  --terminology-domain test
 ```
 
 Model được chọn tự động theo source `vi/en/zh/ko` và tải lần đầu vào
@@ -93,6 +103,52 @@ onevoice sample.wav --source en --target vi --asr-backend fake --mt-backend fake
 ```
 
 CLI xuất JSON Lines cho ASR partial/final, stable transcript, translation và latency.
+
+## Terminology dictionary
+
+Sample bundle nằm tại
+[`assets/terminology/factory-sample-v1/terminology.yaml`](assets/terminology/factory-sample-v1/terminology.yaml).
+Trong Streamlit:
+
+1. Chọn source/target và backend trước.
+2. Bật **Terminology dictionary**.
+3. Chọn domain, ví dụ `test`, `factory-safety` hoặc `factory-maintenance`.
+4. Chờ `Terminology preflight` báo hợp lệ rồi khởi tạo pipeline.
+
+Preflight validate schema/language coverage và compile trước ASR terms, MT
+bindings, TTS spoken forms. UI hiển thị bundle ID, schema, relative path,
+checksum, route và artifact counts. Sau khi pipeline start, toàn bộ lựa chọn bị
+khóa; muốn đổi bundle/domain/backend phải **Stop pipeline**, chỉnh lại rồi Start.
+Không có hot-swap giữa một pipeline session.
+
+Ba cơ chế ASR terminology đang dùng:
+
+| Backend | Guidance trước/trong decode | Lớp an toàn sau ASR |
+|---|---|---|
+| Sherpa streaming Zipformer | Native hotwords trên `modified_beam_search` | Exact alias → canonical |
+| Faster-Whisper | Bounded `initial_prompt` | Exact alias → canonical |
+| Moonshine, Dolphin | Không truyền option native chưa được xác nhận | Exact alias → canonical |
+
+Native hotword và prompt là bias, không phải hard guarantee. Post-correction chỉ
+sửa canonical/alias được khai báo trong active profile; không bật fuzzy
+edit-distance mặc định.
+
+Cấu hình YAML tối thiểu:
+
+```yaml
+terminology:
+  enabled: true
+  bundle_path: assets/terminology/factory-sample-v1/terminology.yaml
+  domain: test
+```
+
+Với Sherpa + terminology, pipeline tự đổi `greedy_search` sang
+`modified_beam_search`. Profile được giới hạn bởi `max_hotword_terms` và
+`max_hotword_tokens`; term ngoài tokenizer vocabulary bị loại khỏi native
+hotwords nhưng exact-alias correction vẫn còn hiệu lực. Chi tiết schema và cách
+thêm term: [sample bundle README](assets/terminology/factory-sample-v1/README.md).
+Thiết kế và trạng thái từng phase:
+[terminology implementation roadmap](docs/plans/terminology/README.md).
 
 ## Cấu hình và thay model
 
@@ -165,6 +221,7 @@ Theo dõi ASR/MT/TTS inference latency, thời gian đến output đầu tiên, 
 - [Moonshine Voice](https://github.com/moonshine-ai/moonshine): code và model English dùng MIT; model Việt/Trung/Hàn dùng Moonshine Community License, **chỉ phi thương mại**. Backend dùng native incremental stream và chỉ nạp phần waveform mới.
 - [Dolphin](https://github.com/DataoceanAI/Dolphin): Apache-2.0 cho code và weights; adapter hiện hỗ trợ `base`/`small` cho Việt, Trung, Hàn. Repo chính thức không liệt kê English.
 - [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper): MIT, CTranslate2 implementation của Whisper.
+- [Sherpa-ONNX](https://github.com/k2-fsa/sherpa-onnx): runtime Apache-2.0; license weights phụ thuộc model. Vietnamese streaming Zipformer `hynt` đang dùng CC-BY-NC-ND-4.0 và cần review trước sử dụng thương mại/phân phối lại.
 - [OPUS-MT](https://github.com/Helsinki-NLP/Opus-MT) chạy bằng [CTranslate2](https://opennmt.net/CTranslate2/): backend mặc định. Các model Việt↔Anh và phần lớn model theo cặp dùng Apache-2.0; `zh-en` và model English→Korean dùng CC-BY-4.0. Kiểm tra model card tương ứng trước khi phân phối sản phẩm.
 - [M2M100-418M](https://huggingface.co/facebook/m2m100_418M): MIT, hỗ trợ trực tiếp cả 12 hướng giữa bốn ngôn ngữ; backend convert Hugging Face weights một lần rồi inference bằng CTranslate2 với target-language prefix.
 - `streamlit-webrtc`: MIT.

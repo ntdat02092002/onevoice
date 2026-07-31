@@ -16,16 +16,16 @@ Ngôn ngữ sản phẩm:
 
 ### Bảng chọn nhanh
 
-| Backend | Language | Model hợp lệ | Auto language | Native streaming | Dependency |
-|---|---|---|---|---|---|
-| `moonshine` | `en` | `auto`, `tiny`, `base`, `tiny_streaming`, `small_streaming`, `medium_streaming` | Không | Có với các model `_streaming` | `moonshine` |
-| `moonshine` | `vi` | `auto`, `base` | Không | Không có weights streaming riêng | `moonshine` |
-| `moonshine` | `zh` | `auto`, `base` | Không | Không có weights streaming riêng | `moonshine` |
-| `moonshine` | `ko` | `auto`, `tiny` | Không | Không có weights streaming riêng | `moonshine` |
-| `dolphin` | `auto`, `vi`, `zh`, `ko` | `base`, `small` | Có, trong tập ngôn ngữ Dolphin hỗ trợ | Không; adapter decode growing utterance | `dolphin` |
-| `faster_whisper` | `auto`, `vi`, `en`, `zh`, `ko` | `tiny`, `base`, `small` trong UI; config có thể dùng Whisper model ID hợp lệ khác | Có | Không; adapter decode lại growing utterance | `models` |
-| `sherpa_onnx` | `vi`, `en`, `zh`, `ko` | `auto` hoặc model streaming mặc định đúng language | Không | Có; `OnlineRecognizer` Zipformer | `sherpa-asr` |
-| `fake` | mọi language sản phẩm | `fake` | Giả lập | Giả lập | Không |
+| Backend | Language | Model hợp lệ | Auto language | Native streaming | Terminology ASR | Dependency |
+|---|---|---|---|---|---|---|
+| `moonshine` | `en` | `auto`, `tiny`, `base`, `tiny_streaming`, `small_streaming`, `medium_streaming` | Không | Có với các model `_streaming` | Exact-alias correction | `moonshine` |
+| `moonshine` | `vi` | `auto`, `base` | Không | Không có weights streaming riêng | Exact-alias correction | `moonshine` |
+| `moonshine` | `zh` | `auto`, `base` | Không | Không có weights streaming riêng | Exact-alias correction | `moonshine` |
+| `moonshine` | `ko` | `auto`, `tiny` | Không | Không có weights streaming riêng | Exact-alias correction | `moonshine` |
+| `dolphin` | `auto`, `vi`, `zh`, `ko` | `base`, `small` | Có, trong tập ngôn ngữ Dolphin hỗ trợ | Không; adapter decode growing utterance | Exact-alias correction | `dolphin` |
+| `faster_whisper` | `auto`, `vi`, `en`, `zh`, `ko` | `tiny`, `base`, `small` trong UI; config có thể dùng Whisper model ID hợp lệ khác | Có | Không; adapter decode lại growing utterance | `initial_prompt` + exact alias | `models` |
+| `sherpa_onnx` | `vi`, `en`, `zh`, `ko` | `auto` hoặc model streaming đúng language | Không | Có; `OnlineRecognizer` Zipformer | Native hotwords + exact alias | `sherpa-asr` |
+| `fake` | mọi language sản phẩm | `fake` | Giả lập | Giả lập | Exact-alias correction | Không |
 
 `Moonshine model=auto` là tự chọn **architecture cho language đã biết**, không phải tự nhận diện language. Với catalog hiện tại, nó resolve `en -> medium_streaming`, `vi -> base`, `zh -> base`, `ko -> tiny`.
 
@@ -64,6 +64,17 @@ Ngôn ngữ sản phẩm:
 
 ### Sherpa-ONNX Streaming Zipformer
 
+| Language | `model` ID được đăng ký | Tokenization | Chunk/context | License |
+|---|---|---|---|---|
+| `vi` | `hynt-zipformer-vi-30m-streaming-6000h-chunk-32` | BPE, uppercase vocabulary | chunk 32, left 128 | CC-BY-NC-ND-4.0 |
+| `en` | `sherpa-onnx-streaming-zipformer-en-2023-06-26` | BPE, uppercase vocabulary | chunk 16, left 128 | Upstream-specific |
+| `zh` | `sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30` | `cjkchar` | Theo upstream graph | Upstream-specific |
+| `ko` | `sherpa-onnx-streaming-zipformer-korean-2024-06-16` | BPE | Theo upstream graph | Upstream-specific |
+
+`model: auto` resolve đúng ID trong bảng theo source language. Đây là bốn model
+online Transducer độc lập, không phải một model multilingual và không hỗ trợ
+`language: auto`.
+
 - Mỗi utterance giữ một native stream và chỉ feed phần waveform chưa xử lý.
 - Adapter ghép token timestamps của OnlineRecognizer thành
   `AsrUpdate.words`; semantic endpoint `N` cắt đúng cuối câu thứ N, không phải
@@ -89,6 +100,41 @@ Ngôn ngữ sản phẩm:
   model dùng `bpe.model`/`bpe.vocab`; Chinese dùng `cjkchar`. Term không biểu diễn
   được bằng tokenizer bị loại và được đếm trong
   `asr_hotword_rejection_count`; exact-alias post-correction vẫn là fallback.
+
+### Terminology capability và lifecycle
+
+```yaml
+terminology:
+  enabled: true
+  bundle_path: assets/terminology/factory-sample-v1/terminology.yaml
+  domain: test
+  asr:
+    initial_prompt_enabled: true
+    post_correction_enabled: true
+    native_hotwords_enabled: true
+    max_prompt_terms: 32
+    max_prompt_tokens: 128
+    max_hotword_terms: 64
+    max_hotword_tokens: 256
+    hotword_score: 1.5
+```
+
+- Sherpa native hotwords bias token/path selection trong Transducer decode.
+- Faster-Whisper `initial_prompt` là decoder context mềm.
+- Exact-alias correction chạy trước commit/MT cho mọi backend; chỉ sửa form đã
+  khai báo trong active profile và giữ/remap word timing khi alignment cho phép.
+- MT dùng placeholder validation + canonical restore theo từng hop; completed
+  sentence của partial được cache, mutable tail luôn dịch lại.
+- Stable Prefix và TTS chunker không emit nửa terminology; TTS dùng spoken form
+  riêng nhưng UI giữ canonical display text.
+
+Streamlit thực hiện preflight trước khi start: validate bundle/coverage, resolve
+MT route và compile ASR/MT/TTS artifacts. Build identity gồm bundle ID, schema,
+relative path, SHA-256 và artifact counts. Khi pipeline chạy, bundle/domain/route
+bị khóa; muốn đổi phải Stop rồi Start lại. Không có in-process hot-swap.
+Kết quả implementation và smoke test nằm trong
+[P7 native hotwords](plans/terminology/p7-implementation-report.md) và
+[P8 lifecycle](plans/terminology/p8-implementation-report.md).
 
 ## Machine Translation
 
@@ -316,6 +362,9 @@ python -m pip install -e ".[models,app]"
 
 # TTS VITS/Piper qua sherpa-onnx
 python -m pip install -e ".[tts,app]"
+
+# Streaming Zipformer ASR + native hotwords
+python -m pip install -e ".[sherpa-asr,opus,app]"
 
 # Tất cả backend
 python -m pip install -e ".[all,app]"
